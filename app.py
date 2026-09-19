@@ -5,7 +5,8 @@ load_dotenv()
 import os
 import sys
 from datetime import timedelta, datetime, timezone
-from flask import Flask, session, jsonify
+from flask import Flask, session, jsonify, request
+from itsdangerous import BadSignature, SignatureExpired
 from flask_cors import CORS
 
 try:
@@ -189,18 +190,59 @@ def api_current_user():
 
 @app.route('/api/test-session', methods=['GET', 'POST'])
 def test_session():
-    from flask import request
+    """TEMPORARY DIAGNOSTIC — open /api/test-session in the browser while logged in.
+
+    Reports what THIS server actually receives for your login cookie, so we can
+    tell "cookie never arrives" from "cookie arrives but is rejected" from
+    "cookie is fine but the session has no username". Remove once solved."""
     if request.method == 'POST':
         data = request.get_json() or {}
         session['test_data'] = data.get('test', 'Session working!')
-        # Signed-cookie sessions have no server-side session ID, so '_id' is always N/A now.
-        return jsonify({"message": "Session data set", "session_id": session.get('_id', 'N/A')}), 200
-    else:
-        return jsonify({
-            "session_data": dict(session),
-            "session_id": session.get('_id', 'N/A'),
-            "has_session": bool(session)
-        }), 200
+        return jsonify({"message": "Session data set"}), 200
+
+    cookie_name = app.config.get('SESSION_COOKIE_NAME', 'session')
+    raw = request.cookies.get(cookie_name)
+
+    decode_status = "no cookie received"
+    if raw:
+        serializer = app.session_interface.get_signing_serializer(app)
+        try:
+            serializer.loads(raw, max_age=int(app.permanent_session_lifetime.total_seconds()))
+            decode_status = "ok"
+        except SignatureExpired:
+            decode_status = "expired"
+        except BadSignature:
+            decode_status = "bad signature (SECRET_KEY differs from the one that signed this cookie)"
+        except Exception as e:
+            decode_status = f"error: {e!r}"
+
+    return jsonify({
+        "cookie_received": bool(raw),
+        "cookie_length": len(raw) if raw else 0,
+        "decode_status": decode_status,
+        "session_keys": sorted(session.keys()),
+        "has_username": 'username' in session,
+        "secret_key_from_env": bool(os.environ.get('SECRET_KEY')),
+        "worker_pid": os.getpid(),
+        "host": request.host,
+        "forwarded_proto": request.headers.get('X-Forwarded-Proto'),
+        "server_time_utc": datetime.now(timezone.utc).isoformat(),
+    }), 200
+
+
+@app.after_request
+def log_unauthorized(resp):
+    """Print one line to the Render logs for every 401, so the cause is visible
+    there too (cookie missing vs. cookie present but no username in it)."""
+    if resp.status_code == 401:
+        cookie_name = app.config.get('SESSION_COOKIE_NAME', 'session')
+        print(
+            f"[401] {request.method} {request.path} "
+            f"cookie_received={request.cookies.get(cookie_name) is not None} "
+            f"has_username={'username' in session} pid={os.getpid()}",
+            flush=True,
+        )
+    return resp
 
 
 @app.errorhandler(404)
