@@ -7,7 +7,6 @@ import sys
 from datetime import timedelta
 from flask import Flask, session, jsonify
 from flask_cors import CORS
-from flask_session import Session
 
 try:
     from supabase_client import supabase
@@ -43,17 +42,40 @@ app = Flask(__name__)
 IS_PRODUCTION = os.environ.get('FLASK_ENV', '').lower() == 'production'
 
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production-12345')
-app.config['SESSION_TYPE'] = 'filesystem'
-app.config['SESSION_PERMANENT'] = True
+
+# BUG FIX: "logged in, then suddenly logged out" on Render.
+# SESSION_TYPE='filesystem' stored session data as files on the server's
+# local disk (see the flask_session/ folder). Render's free tier spins
+# the container down after inactivity and can restart it on a fresh
+# filesystem at any time — every stored session file is wiped when that
+# happens. The browser still holds a perfectly valid cookie pointing at
+# a session ID, but the server no longer has any record of that ID, so
+# the very next request looks logged-out with no warning.
+#
+# Switching to Flask's built-in signed-cookie session (the default when
+# SESSION_TYPE is not set) stores the session data itself inside the
+# signed cookie, cryptographically protected by SECRET_KEY. There's
+# nothing on the server to lose, so a restart or cold start no longer
+# invalidates anyone's session.
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 
 app.config['SESSION_COOKIE_SECURE'] = IS_PRODUCTION
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'None' if IS_PRODUCTION else 'Lax'
 app.config['SESSION_COOKIE_DOMAIN'] = os.environ.get('SESSION_COOKIE_DOMAIN') or None
-app.config['SESSION_USE_SIGNER'] = True
 
-Session(app)
+
+@app.before_request
+def make_session_permanent():
+    """Flask-Session's SESSION_PERMANENT=True made every session last
+    PERMANENT_SESSION_LIFETIME. Flask's built-in sessions don't have that
+    setting — they only get the 24h lifetime if session.permanent is True.
+    Without this, the cookie would die when the browser closes. We only
+    flag sessions that are actually logged in, so anonymous visitors don't
+    receive a Set-Cookie on every request."""
+    if 'username' in session and not session.permanent:
+        session.permanent = True
+
 
 ALLOWED_ORIGINS = [
     'http://localhost:3000',
@@ -155,6 +177,7 @@ def test_session():
     if request.method == 'POST':
         data = request.get_json() or {}
         session['test_data'] = data.get('test', 'Session working!')
+        # Signed-cookie sessions have no server-side session ID, so '_id' is always N/A now.
         return jsonify({"message": "Session data set", "session_id": session.get('_id', 'N/A')}), 200
     else:
         return jsonify({
@@ -179,7 +202,7 @@ if __name__ == "__main__":
     print("STARTING FLASK APPLICATION")
     print("=" * 50)
     print(f"SECRET_KEY: {'Set' if app.config['SECRET_KEY'] else 'Not Set'}")
-    print(f"SESSION_TYPE: {app.config['SESSION_TYPE']}")
+    print("SESSION_TYPE: signed cookie (Flask default)")
     print(f"SESSION_COOKIE_SAMESITE: {app.config['SESSION_COOKIE_SAMESITE']}")
     print(f"SESSION_COOKIE_SECURE: {app.config['SESSION_COOKIE_SECURE']}")
     print(f"IS_PRODUCTION (FLASK_ENV): {IS_PRODUCTION}")
