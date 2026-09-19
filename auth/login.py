@@ -328,7 +328,12 @@ def logout_beacon():
 
             safe_record_action(user_id, "LOGOUT_BEACON", {})
 
-        session.clear()
+        # Deliberately NOT calling session.clear() here. sendBeacon fires on
+        # page unload/hide (reload, tab switch, navigation) and can't tell those
+        # apart from the tab really closing, so clearing the session here
+        # silently logged people out. The frontend keeps its auth flag in
+        # sessionStorage, which disappears when the tab closes, and an explicit
+        # Logout still goes through /api/logout, which does clear the session.
 
     except Exception:
         pass
