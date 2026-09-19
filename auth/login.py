@@ -49,11 +49,58 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+# ─────────────────────────────────────────────
+# AUDIT LOG ADAPTER
+# ─────────────────────────────────────────────
+# This file calls safe_record_action(user_id, action, details), but
+# logs.Audits.record_action has the signature
+# record_action(action, description, username=None, meta=None, ip=None).
+# Passing the arguments straight through stored the user id as the action
+# and the details dict as the username, which is why login rows looked
+# garbled. This adapter translates between the two, and maps LOGIN_SUCCESS
+# onto "LOGIN", the key the Audit Logs page actually has a badge for.
+AUDIT_ACTION_MAP = {
+    "LOGIN_SUCCESS": "LOGIN",
+}
+
+AUDIT_DESCRIPTIONS = {
+    "LOGIN_SUCCESS": "Signed in",
+    "LOGIN_FAILED":  "Failed sign-in attempt",
+    "LOGOUT":        "Signed out",
+    "LOGOUT_BEACON": "Left the page or closed the tab",
+}
+
+
+def client_ip():
+    """Real client IP. Behind Vercel/Render, request.remote_addr is the proxy's
+    address, so prefer the first entry of X-Forwarded-For."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr
+
+
 def safe_record_action(user_id, action, details=None):
     """Safely record an audit action - handles errors gracefully"""
     try:
         from logs.Audits import record_action
-        return record_action(user_id, action, details)
+
+        details = dict(details or {})
+        description = AUDIT_DESCRIPTIONS.get(action, action.replace("_", " ").title())
+        if details.get("reason"):
+            description = f"{description}: {details['reason']}"
+
+        username = details.get("username") or session.get("username")
+        if user_id is not None:
+            details.setdefault("user_id", user_id)
+
+        return record_action(
+            AUDIT_ACTION_MAP.get(action, action),
+            description,
+            username=username,
+            meta=details,
+            ip=client_ip(),
+        )
     except Exception as e:
         print(f"[AUDIT ERROR] {e}")
         return None
@@ -180,7 +227,10 @@ def login():
         # Verify password using salted hash comparison
         if not stored_hash or not verify_password(password, stored_hash):
             print(f"[LOGIN] Password mismatch for user '{username}'")
-            safe_record_action(user.get('id'), "LOGIN_FAILED", {"reason": "Invalid password"})
+            safe_record_action(user.get('id'), "LOGIN_FAILED", {
+                "username": username,
+                "reason": "Invalid password",
+            })
             return jsonify({
                 "success": False,
                 "message": "Invalid username or password"
@@ -189,7 +239,10 @@ def login():
         # Check if user is locked. The schema stores this as an integer
         # 'lock_level' (0 = unlocked), not a boolean 'is_locked' column.
         if user.get('lock_level', 0) > 0:
-            safe_record_action(user['id'], "LOGIN_FAILED", {"reason": "Account locked"})
+            safe_record_action(user['id'], "LOGIN_FAILED", {
+                "username": username,
+                "reason": "Account locked",
+            })
             return jsonify({
                 "success": False,
                 "message": "Account is locked. Please contact an administrator."
@@ -291,7 +344,8 @@ def logout():
             except Exception as e:
                 print(f"[LOGOUT UPDATE ERROR] {e}")
 
-            safe_record_action(user_id, "LOGOUT", {})
+            # Must run BEFORE session.clear() so the username is still available.
+            safe_record_action(user_id, "LOGOUT", {"username": session.get('username')})
 
         session.clear()
 
@@ -326,7 +380,7 @@ def logout_beacon():
             except Exception:
                 pass
 
-            safe_record_action(user_id, "LOGOUT_BEACON", {})
+            safe_record_action(user_id, "LOGOUT_BEACON", {"username": session.get('username')})
 
         # Deliberately NOT calling session.clear() here. sendBeacon fires on
         # page unload/hide (reload, tab switch, navigation) and can't tell those
