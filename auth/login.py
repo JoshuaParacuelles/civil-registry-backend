@@ -1,8 +1,8 @@
 import os
 import sys
 import json
-from datetime import datetime, timezone, timedelta
-from flask import Blueprint, request, jsonify, session, current_app
+from datetime import datetime, timezone
+from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from supabase_client import supabase
 
@@ -10,6 +10,13 @@ login_bp = Blueprint('login', __name__)
 
 ADMIN_ONLY_MODULES = {"role_management", "user_management", "audit_logs"}
 RESERVED_ADMIN_USERNAME = "admin"
+
+# Session lifetimes (seconds). Stored INSIDE each session as `ttl` and enforced
+# by enforce_session_expiry() in app.py. Do NOT change
+# app.config['PERMANENT_SESSION_LIFETIME'] per login: that value is global to
+# the whole process, and Flask uses it to validate every session cookie's age.
+SESSION_TTL_DEFAULT = 24 * 3600
+SESSION_TTL_REMEMBER_ME = 7 * 24 * 3600
 
 # The single source of truth for which column holds the password hash.
 # Rolemanagement.py (account creation, password reset, and the bootstrap
@@ -206,15 +213,17 @@ def login():
         session['user_id'] = user['id']
         session['username'] = user['username']
         session['is_admin'] = is_admin_flag
+        # NOTE: with signed-cookie sessions everything below lives inside the
+        # browser cookie, which browsers silently drop above ~4 KB. If no other
+        # route reads session['user_data'], delete this line to keep the cookie small.
         user_data = {k: v for k, v in user.items() if k != PASSWORD_COLUMN}
         session['user_data'] = user_data
         session['logged_in_at'] = now_iso()
 
+        # Per-session lifetime, enforced by enforce_session_expiry() in app.py.
+        session['ttl'] = SESSION_TTL_REMEMBER_ME if remember_me else SESSION_TTL_DEFAULT
+        session['last_seen'] = datetime.now(timezone.utc).timestamp()
         session.permanent = True
-        if remember_me:
-            current_app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
-        else:
-            current_app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
 
         print(f"[LOGIN] Session set for user: {username}")
 
@@ -382,13 +391,15 @@ def get_session():
             }), 200
 
         except Exception as e:
+            # A transient Supabase/network error (timeout, dropped connection,
+            # Render cold start) lands here. The login itself is still valid,
+            # so do NOT clear the session — doing so turned any one-off backend
+            # hiccup into a permanent logout. Report a temporary failure instead
+            # and let the client retry on its next poll/focus.
             print(f"[SESSION ERROR] {e}")
-            session.clear()
             return jsonify({
-                "authenticated": False,
-                "permissions": [],
-                "is_admin": False
-            }), 200
+                "error": "Temporary server error, please retry"
+            }), 503
 
     except Exception as e:
         print(f"[SESSION ERROR] {e}")

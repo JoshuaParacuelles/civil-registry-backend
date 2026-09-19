@@ -4,7 +4,7 @@ load_dotenv()
 
 import os
 import sys
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from flask import Flask, session, jsonify
 from flask_cors import CORS
 
@@ -57,7 +57,11 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-i
 # signed cookie, cryptographically protected by SECRET_KEY. There's
 # nothing on the server to lose, so a restart or cold start no longer
 # invalidates anyone's session.
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
+# Upper bound only. Flask applies this GLOBAL value when validating every
+# session cookie's age, so it must never be changed per-login. The real
+# per-session lifetime (24h, or 7 days for "remember me") is stored inside
+# each session and enforced by enforce_session_expiry() below.
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
 app.config['SESSION_COOKIE_SECURE'] = IS_PRODUCTION
 app.config['SESSION_COOKIE_HTTPONLY'] = True
@@ -66,15 +70,27 @@ app.config['SESSION_COOKIE_DOMAIN'] = os.environ.get('SESSION_COOKIE_DOMAIN') or
 
 
 @app.before_request
-def make_session_permanent():
-    """Flask-Session's SESSION_PERMANENT=True made every session last
-    PERMANENT_SESSION_LIFETIME. Flask's built-in sessions don't have that
-    setting — they only get the 24h lifetime if session.permanent is True.
-    Without this, the cookie would die when the browser closes. We only
-    flag sessions that are actually logged in, so anonymous visitors don't
-    receive a Set-Cookie on every request."""
-    if 'username' in session and not session.permanent:
-        session.permanent = True
+def enforce_session_expiry():
+    """Per-session lifetime, kept inside the session itself.
+
+    login.py stamps each session with `ttl` (seconds: 24h normally, 7 days for
+    "remember me") and this hook keeps `last_seen` current, expiring the
+    session after `ttl` seconds of inactivity. This replaces mutating
+    app.config['PERMANENT_SESSION_LIFETIME'] on every login, which changed the
+    lifetime for ALL users (and, per worker process, inconsistently) and made
+    Flask reject still-valid cookies.
+
+    Sessions created before this change have no ttl/last_seen; they simply pick
+    up the defaults below, so nobody is logged out by the deploy itself."""
+    if 'username' not in session:
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    ttl = session.get('ttl', 24 * 3600)
+    if now - session.get('last_seen', now) > ttl:
+        session.clear()
+        return
+    session['last_seen'] = now
+    session.permanent = True
 
 
 ALLOWED_ORIGINS = [
