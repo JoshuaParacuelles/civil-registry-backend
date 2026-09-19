@@ -1,2 +1,8 @@
 python-dotenv
 requests
+Flask
+flask-cors
+flask-session
+gunicorn
+supabase
+werkzeug
