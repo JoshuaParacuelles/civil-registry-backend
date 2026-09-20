@@ -1,4 +1,6 @@
 import os
+from urllib.parse import quote
+
 import requests
 from flask import Blueprint, jsonify, request
 
@@ -9,6 +11,20 @@ SCIMS_TOKEN    = os.getenv("SCIMS_API_TOKEN", "")  # optional — API works with
 SCIMS_TIMEOUT  = float(os.getenv("SCIMS_API_TIMEOUT", "10"))
 MAX_SEARCH_PAGES = int(os.getenv("SCIMS_API_MAX_PAGES", "50"))  # cap for auto-paginated search only
 
+# Some hosts/WAFs (e.g. Cloudflare) block the default "python-requests/x.y.z"
+# User-Agent. We send a normal browser-style one instead. Override it with the
+# SCIMS_API_USER_AGENT env var if you ever need to.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+SCIMS_USER_AGENT = os.getenv("SCIMS_API_USER_AGENT", DEFAULT_USER_AGENT)
+SCIMS_REFERER    = os.getenv("SCIMS_API_REFERER", "")  # optional
+
+# When SCIMS_API_DEBUG=1, a 401/403 response also includes a short snippet of
+# the upstream reply (visible via /api/external/health). Leave it OFF normally.
+SCIMS_DEBUG = os.getenv("SCIMS_API_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+
 # Placeholder junk the source API sometimes puts in real fields
 # (e.g. tel_no: "None"/"none"/"-", suffix: "N/A"). Normalized to None
 # so the frontend can treat them as empty consistently.
@@ -16,7 +32,13 @@ _EMPTY_VALUES = {"", "none", "n/a", "-", "null", "undefined"}
 
 
 def _scims_headers():
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": SCIMS_USER_AGENT,
+    }
+    if SCIMS_REFERER:
+        headers["Referer"] = SCIMS_REFERER
     if SCIMS_TOKEN:
         headers["Authorization"] = f"Bearer {SCIMS_TOKEN}"
     return headers
@@ -40,8 +62,22 @@ def _scims_get(path, params=None):
         return None, {"error": "External API request failed."}, 502
 
     if resp.status_code in (401, 403):
-        print(f"[external_scims] rejected: {resp.status_code} {resp.text[:200]}")
-        return None, {"error": "External API rejected the request."}, resp.status_code
+        snippet = resp.text[:300]
+        print(
+            f"[external_scims] rejected: {resp.status_code} "
+            f"url={resp.url} "
+            f"server={resp.headers.get('Server')} "
+            f"cf-ray={resp.headers.get('CF-RAY')} "
+            f"content-type={resp.headers.get('Content-Type')} "
+            f"body={snippet!r}"
+        )
+        err = {
+            "error": "External API rejected the request.",
+            "upstream_status": resp.status_code,
+        }
+        if SCIMS_DEBUG:
+            err["debug"] = snippet
+        return None, err, resp.status_code
 
     if resp.status_code == 404:
         return None, {"error": "External API resource not found."}, 404
@@ -229,7 +265,7 @@ def get_entity(id):
     normalized record (every field explicitly present) for the detail
     modal on the frontend.
     """
-    data, err, status = _scims_get(f"/individual/{id}")
+    data, err, status = _scims_get(f"/individual/{quote(str(id), safe='')}")
     if err:
         return jsonify(err), status
 
@@ -244,9 +280,14 @@ def get_entity(id):
 def health_check():
     """Quick check that the integration is reachable."""
     data, err, status = _scims_get("/individual", params={"page": 1})
-    return jsonify({
+    body = {
         "reachable": err is None,
         "base_url": SCIMS_BASE_URL,
         "auth_mode": "bearer_token" if SCIMS_TOKEN else "none (public endpoint)",
         "detail": err["error"] if err else "OK",
-    }), (200 if err is None else status)
+    }
+    if err and "upstream_status" in err:
+        body["upstream_status"] = err["upstream_status"]
+    if err and "debug" in err:
+        body["debug"] = err["debug"]
+    return jsonify(body), (200 if err is None else status)
