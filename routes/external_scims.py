@@ -7,7 +7,26 @@ from flask import Blueprint, jsonify, request
 external_bp = Blueprint("external", __name__, url_prefix="/api/external")
 
 SCIMS_BASE_URL = os.getenv("SCIMS_API_BASE_URL", "https://cictd.app/api/scims").rstrip("/")
-SCIMS_TOKEN    = os.getenv("SCIMS_API_TOKEN", "")  # optional — API works without it
+
+
+def _load_token():
+    """
+    Read SCIMS_API_TOKEN (optional — the API works without it).
+    A placeholder copied from an example .env (e.g. "paste_your_bearer_token_here")
+    would be sent as a real Bearer token and get rejected, so those are ignored.
+    """
+    token = os.getenv("SCIMS_API_TOKEN", "").strip().strip('"').strip("'")
+    if not token:
+        return ""
+    low = token.lower()
+    placeholders = ("paste_your", "your_token", "your_bearer", "bearer_token_here", "changeme", "xxxx")
+    if any(p in low for p in placeholders):
+        print("[external_scims] SCIMS_API_TOKEN looks like a placeholder - ignoring it.")
+        return ""
+    return token
+
+
+SCIMS_TOKEN    = _load_token()
 SCIMS_TIMEOUT  = float(os.getenv("SCIMS_API_TIMEOUT", "10"))
 MAX_SEARCH_PAGES = int(os.getenv("SCIMS_API_MAX_PAGES", "50"))  # cap for auto-paginated search only
 
