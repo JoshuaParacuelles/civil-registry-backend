@@ -149,6 +149,14 @@ with app.app_context():
         print(f"[INIT ERROR] Failed to initialize database tables: {e}")
 
 
+@app.route('/', methods=['GET'])
+def index():
+    """Friendly root route so opening https://civil-registry.onrender.com/
+    in a browser shows a status message instead of the 404 JSON error.
+    This backend is API-only; the actual app lives on the Vercel frontend."""
+    return {"status": "ok", "service": "civil-registry API"}, 200
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return {"status": "healthy"}, 200
