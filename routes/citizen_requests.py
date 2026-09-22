@@ -34,7 +34,7 @@ from flask import Blueprint, request, jsonify, session
 
 from supabase_client import supabase
 from auth.Rolemanagement import is_admin, get_user_permissions
-from email_service import send_status_update_email
+from .email_service import send_status_update_email
 from logs.Audits import record_action
 
 citizen_requests_bp = Blueprint("citizen_requests_bp", __name__)
