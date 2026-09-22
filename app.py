@@ -27,6 +27,7 @@ from routes.analytics import analytics_bp
 from routes.notification import notifications_bp
 from routes.external_scims import external_bp
 from routes.document import document_bp
+from routes.citizen_requests import citizen_requests_bp 
 from auth.birth_password import birth_archive_bp, init_birth_archive_db
 from auth.Death_password import death_archive_bp, init_death_archive_db
 from auth.marriage_password import marriage_auth_bp, init_marriage_archive_db
@@ -136,6 +137,7 @@ app.register_blueprint(role_bp)
 app.register_blueprint(notifications_bp)
 app.register_blueprint(external_bp)
 app.register_blueprint(document_bp)
+app.register_blueprint(citizen_requests_bp)   # ← IDUGANG DINHI
 
 with app.app_context():
     try:
