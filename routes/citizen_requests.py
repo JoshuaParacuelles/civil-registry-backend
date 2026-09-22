@@ -197,12 +197,23 @@ def update_citizen_request_status(record_id):
         # ADMIN bell in Home.jsx — the admin performing this update
         # doesn't need to be told about their own action). Best-effort:
         # a failed/unconfigured email never blocks the status update
-        # itself, it's just logged server-side.
-        send_status_update_email(
-            to_email=row.get("requester_email"),
+        # itself (the DB row above is already committed), but we DO
+        # capture the real True/False result here so the response and
+        # audit log reflect what actually happened, instead of always
+        # claiming "Citizen notified" regardless of outcome.
+        requester_email = row.get("requester_email")
+        email_sent = send_status_update_email(
+            to_email=requester_email,
             subject=f"{kind.title()} Certificate Request — {status_label}",
             body=message,
         )
+
+        if not requester_email:
+            email_status_message = "Status updated, but no email is on file for this request — citizen was not notified."
+        elif email_sent:
+            email_status_message = "Status updated. Citizen notified by email."
+        else:
+            email_status_message = "Status updated, but the notification email failed to send. Check server logs."
 
         record_action(
             "REQUEST_STATUS_UPDATE",
@@ -214,6 +225,7 @@ def update_citizen_request_status(record_id):
                 "old_status": old_status,
                 "new_status": new_status,
                 "note": note,
+                "email_sent": email_sent,
             },
             ip=request.remote_addr,
         )
@@ -226,6 +238,8 @@ def update_citizen_request_status(record_id):
             "status": new_status,
             "status_label": status_label,
             "updated_at": now_iso,
+            "email_sent": email_sent,
+            "message": email_status_message,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
