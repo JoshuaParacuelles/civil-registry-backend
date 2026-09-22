@@ -14,6 +14,17 @@ already imports from auth.Rolemanagement) rather than a decorator, to
 avoid depending on a require_admin() helper that may not exist yet.
 Swap _staff_required() below for a proper permission-based decorator
 once one is available.
+
+CHANGED: a status update ("PROCESSING", "READY_FOR_PICKUP",
+"COMPLETED", etc.) used to call push_notification(...) into the shared
+`notification` table, which showed up in the ADMIN bell in Home.jsx.
+That's backwards — the admin is the one performing the update and
+doesn't need to be notified about their own action, and the citizen
+(who has no login) never saw it at all. Status updates now instead
+email the citizen directly at the Gmail address they gave on the
+request form (`requester_email`), via email_service.send_status_update_email.
+No row is written to `notification` for a status update anymore, so
+the admin bell stays quiet for these.
 """
 
 from functools import wraps
@@ -23,7 +34,7 @@ from flask import Blueprint, request, jsonify, session
 
 from supabase_client import supabase
 from auth.Rolemanagement import is_admin, get_user_permissions
-from routes.notification import push_notification
+from email_service import send_status_update_email
 from logs.Audits import record_action
 
 citizen_requests_bp = Blueprint("citizen_requests_bp", __name__)
@@ -174,28 +185,23 @@ def update_citizen_request_status(record_id):
             "updated_at": now_iso,
         }).eq("id", record_id).execute()
 
-        subject = who(kind, row)
+        who_name = who(kind, row)
         status_label = STATUS_LABELS.get(new_status, new_status)
         message = f"Your {kind} certificate request (Control No: {row.get('control_no')}) is now: {status_label}."
         if note:
             message += f" Note: {note}"
 
-        # Reuses the existing notification pipeline so this shows up live
-        # in Home.jsx's bell exactly like a brand-new submission does, via
-        # the existing Supabase Realtime subscription on `notification`.
-        push_notification(
-            record_type=kind,
-            record_id=record_id,
-            control_no=row.get("control_no"),
-            title=f"{kind.title()} Request Update",
-            message=message,
-            request_snapshot={
-                "control_no": row.get("control_no"),
-                "subject": subject,
-                "status": new_status,
-                "old_status": old_status,
-                "note": note,
-            },
+        # CHANGED: emails the citizen directly at the Gmail address they
+        # gave on the request form, instead of writing a row into the
+        # shared `notification` table (which used to surface in the
+        # ADMIN bell in Home.jsx — the admin performing this update
+        # doesn't need to be told about their own action). Best-effort:
+        # a failed/unconfigured email never blocks the status update
+        # itself, it's just logged server-side.
+        send_status_update_email(
+            to_email=row.get("requester_email"),
+            subject=f"{kind.title()} Certificate Request — {status_label}",
+            body=message,
         )
 
         record_action(
