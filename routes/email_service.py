@@ -1,25 +1,3 @@
-"""
-email_service.py
------------------
-Sends status-update emails directly to the citizen/requester's Gmail
-address (collected on the public request form as `requester_email`,
-stored on the civil_registry_request row).
-
-Uses Gmail's SMTP relay. Configure these in your .env:
-
-    GMAIL_SENDER_EMAIL=your-office-account@gmail.com
-    GMAIL_SENDER_APP_PASSWORD=xxxxxxxxxxxxxxxx
-
-GMAIL_SENDER_APP_PASSWORD must be a Gmail "App Password" (Google
-Account -> Security -> 2-Step Verification -> App passwords), not the
-account's normal login password — Gmail rejects SMTP logins with the
-regular password when 2FA is enabled.
-
-If these env vars aren't set, or the requester has no email on file,
-sending is skipped and logged — it never raises, so a missing/broken
-email configuration can't break the status-update endpoint itself.
-"""
-
 import os
 import smtplib
 import ssl
@@ -43,8 +21,12 @@ def send_status_update_email(to_email, subject, body):
         print("[email_service] No requester_email on file for this request — skipping email notification.")
         return False
 
-    if not GMAIL_SENDER_EMAIL or not GMAIL_SENDER_APP_PASSWORD:
-        print("[email_service] GMAIL_SENDER_EMAIL / GMAIL_SENDER_APP_PASSWORD not set — skipping email notification.")
+    if not GMAIL_SENDER_EMAIL:
+        print("[email_service] GMAIL_SENDER_EMAIL not set — skipping email notification.")
+        return False
+
+    if not GMAIL_SENDER_APP_PASSWORD:
+        print("[email_service] GMAIL_SENDER_APP_PASSWORD not set — skipping email notification.")
         return False
 
     msg = EmailMessage()
