@@ -32,6 +32,10 @@ sms_service.send_status_update_sms (Semaphore). Email and SMS are both
 best-effort and independent of each other — one failing/being
 unconfigured never blocks the other or the status update itself (the
 DB row is already committed before either is attempted).
+
+CHANGED: "Ready for Pickup" removed from the set of valid statuses —
+only Pending Review, Being Processed, and Completed are selectable now
+(REJECTED remains available as a separate terminal state).
 """
 
 from functools import wraps
@@ -49,11 +53,10 @@ citizen_requests_bp = Blueprint("citizen_requests_bp", __name__)
 
 REQUEST_TABLE = "civil_registry_request"
 
-STATUS_ORDER = ["PENDING", "PROCESSING", "READY_FOR_PICKUP", "COMPLETED"]
+STATUS_ORDER = ["PENDING", "PROCESSING", "COMPLETED"]
 STATUS_LABELS = {
     "PENDING": "Pending Review",
     "PROCESSING": "Being Processed",
-    "READY_FOR_PICKUP": "Ready for Pickup",
     "COMPLETED": "Completed",
     "REJECTED": "Rejected",
 }
