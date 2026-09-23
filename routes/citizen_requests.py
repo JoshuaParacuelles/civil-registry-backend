@@ -25,6 +25,13 @@ email the citizen directly at the Gmail address they gave on the
 request form (`requester_email`), via email_service.send_status_update_email.
 No row is written to `notification` for a status update anymore, so
 the admin bell stays quiet for these.
+
+CHANGED (SMS): status updates now ALSO text the citizen at the mobile
+number they gave on the request form (`requester_telephone`), via
+sms_service.send_status_update_sms (Semaphore). Email and SMS are both
+best-effort and independent of each other — one failing/being
+unconfigured never blocks the other or the status update itself (the
+DB row is already committed before either is attempted).
 """
 
 from functools import wraps
@@ -35,6 +42,7 @@ from flask import Blueprint, request, jsonify, session
 from supabase_client import supabase
 from auth.Rolemanagement import is_admin, get_user_permissions
 from .email_service import send_status_update_email
+from .sms_service import send_status_update_sms
 from logs.Audits import record_action
 
 citizen_requests_bp = Blueprint("citizen_requests_bp", __name__)
@@ -191,16 +199,11 @@ def update_citizen_request_status(record_id):
         if note:
             message += f" Note: {note}"
 
-        # CHANGED: emails the citizen directly at the Gmail address they
-        # gave on the request form, instead of writing a row into the
-        # shared `notification` table (which used to surface in the
-        # ADMIN bell in Home.jsx — the admin performing this update
-        # doesn't need to be told about their own action). Best-effort:
-        # a failed/unconfigured email never blocks the status update
-        # itself (the DB row above is already committed), but we DO
-        # capture the real True/False result here so the response and
-        # audit log reflect what actually happened, instead of always
-        # claiming "Citizen notified" regardless of outcome.
+        # Email: best-effort, sent to the Gmail address the citizen gave
+        # on the request form. A failed/unconfigured email never blocks
+        # the status update itself (the DB row above is already
+        # committed), but we DO capture the real True/False result here
+        # so the response and audit log reflect what actually happened.
         requester_email = row.get("requester_email")
         email_sent = send_status_update_email(
             to_email=requester_email,
@@ -208,12 +211,26 @@ def update_citizen_request_status(record_id):
             body=message,
         )
 
-        if not requester_email:
-            email_status_message = "Status updated, but no email is on file for this request — citizen was not notified."
-        elif email_sent:
-            email_status_message = "Status updated. Citizen notified by email."
+        # SMS: same best-effort contract as email, sent to the mobile
+        # number the citizen gave on the request form, via Semaphore.
+        requester_phone = row.get("requester_telephone")
+        sms_sent = send_status_update_sms(
+            to_number=requester_phone,
+            message=message,
+        )
+
+        notified_via = []
+        if email_sent:
+            notified_via.append("email")
+        if sms_sent:
+            notified_via.append("SMS")
+
+        if notified_via:
+            notify_status_message = f"Status updated. Citizen notified by {' and '.join(notified_via)}."
+        elif not requester_email and not requester_phone:
+            notify_status_message = "Status updated, but no email or phone number is on file for this request — citizen was not notified."
         else:
-            email_status_message = "Status updated, but the notification email failed to send. Check server logs."
+            notify_status_message = "Status updated, but the notification (email/SMS) failed to send. Check server logs."
 
         record_action(
             "REQUEST_STATUS_UPDATE",
@@ -226,6 +243,7 @@ def update_citizen_request_status(record_id):
                 "new_status": new_status,
                 "note": note,
                 "email_sent": email_sent,
+                "sms_sent": sms_sent,
             },
             ip=request.remote_addr,
         )
@@ -239,7 +257,8 @@ def update_citizen_request_status(record_id):
             "status_label": status_label,
             "updated_at": now_iso,
             "email_sent": email_sent,
-            "message": email_status_message,
+            "sms_sent": sms_sent,
+            "message": notify_status_message,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
