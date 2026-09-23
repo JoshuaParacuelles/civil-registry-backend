@@ -19,6 +19,112 @@ from routes.notification import push_notification
 from logs.Audits import record_action
 
 
+# =============================================================================
+# ONLINE-REQUEST DETECTION — shared by Birth/Death/Marriage "complete
+# transaction" / "create payment" routes below.
+#
+# WHY THIS WAS ADDED: push_notification() was previously called any time a
+# transaction matched an EXISTING record in birth_records / death_records /
+# marriage_records (record_status "ACTIVE"/"POSITIVE") — regardless of
+# whether that record was ever submitted through the public Online Request
+# system, or was simply looked up/processed directly from the Birth/
+# Marriage/Death data by staff. That meant processing an existing record
+# (e.g. "John Doe") straight from the archive triggered the exact same
+# client-facing notification as an actual online citizen submission, even
+# though nobody submitted anything online and there is no client to notify.
+#
+# Fix: before any push_notification() call below, check whether a matching
+# row actually exists in `civil_registry_request` — the table the public
+# Online Request system writes to (see routes/citizen_requests.py) — for
+# this same person and record type. Only when such a row exists do we treat
+# the transaction as originating from an online request and fire the
+# notification. A record processed directly from Birth/Marriage/Death data,
+# with no corresponding online submission, now never triggers a
+# notification (no email, no SMS, no admin/client alert of any kind).
+#
+# Matching is done two ways, either of which is sufficient:
+#   1. By control number, if the payment/OR reference passed in happens to
+#      match an actual online request's control_no.
+#   2. By name, against the same columns citizen_requests.py's own search
+#      already uses (child_firstname/child_surname for birth,
+#      deceased_firstname/deceased_surname for death, husband_fullname /
+#      wife_maiden_name for marriage).
+#
+# Any lookup failure (e.g. a transient DB error) fails CLOSED — i.e. no
+# notification — since the requirement is that notifications only ever go
+# out for confirmed online requests, never "notify by default".
+# =============================================================================
+
+CIVIL_REGISTRY_REQUEST_TABLE = "civil_registry_request"
+
+
+def _matches_online_birth_request(first_name: Optional[str], last_name: Optional[str],
+                                   control_no: Optional[str] = None) -> bool:
+    try:
+        if control_no:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "birth").eq("control_no", control_no).limit(1).execute()
+            if res.data:
+                return True
+        if first_name and last_name:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "birth") \
+                .ilike("child_firstname", first_name.strip()) \
+                .ilike("child_surname", last_name.strip()) \
+                .limit(1).execute()
+            return bool(res.data)
+        return False
+    except Exception:
+        return False
+
+
+def _matches_online_death_request(first_name: Optional[str], last_name: Optional[str],
+                                   control_no: Optional[str] = None) -> bool:
+    try:
+        if control_no:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "death").eq("control_no", control_no).limit(1).execute()
+            if res.data:
+                return True
+        if first_name and last_name:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "death") \
+                .ilike("deceased_firstname", first_name.strip()) \
+                .ilike("deceased_surname", last_name.strip()) \
+                .limit(1).execute()
+            return bool(res.data)
+        return False
+    except Exception:
+        return False
+
+
+def _matches_online_marriage_request(groom_full_name: Optional[str] = None,
+                                      bride_full_name: Optional[str] = None,
+                                      control_no: Optional[str] = None) -> bool:
+    try:
+        if control_no:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "marriage").eq("control_no", control_no).limit(1).execute()
+            if res.data:
+                return True
+        if groom_full_name:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "marriage") \
+                .ilike("husband_fullname", groom_full_name.strip()) \
+                .limit(1).execute()
+            if res.data:
+                return True
+        if bride_full_name:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "marriage") \
+                .ilike("wife_maiden_name", bride_full_name.strip()) \
+                .limit(1).execute()
+            return bool(res.data)
+        return False
+    except Exception:
+        return False
+
+
 # #############################################################################
 # ############################  DEATH  BACKEND  ##############################
 # (originally routes/Death.py)
@@ -572,8 +678,15 @@ def complete_transaction():
             "created_at": now_dt().isoformat()
         }).execute()
 
-        # ── NOTIFICATION: only fire when record was FOUND in the database ─────
-        if record_status in ("ACTIVE", "POSITIVE"):
+        # ── NOTIFICATION: only fire when record was FOUND in the database
+        # AND that record was originally submitted through the Online
+        # Request system (see _matches_online_death_request() /
+        # CIVIL_REGISTRY_REQUEST_TABLE at the top of this file). Processing
+        # an existing death record directly from the Death data — with no
+        # matching online request — no longer sends any notification. ──
+        if record_status in ("ACTIVE", "POSITIVE") and _matches_online_death_request(
+            first_name, last_name, control_no=payment_reference or None
+        ):
             full_name_parts = [p for p in [first_name, middle_name, last_name] if p]
             subject = " ".join(full_name_parts) if full_name_parts else (search_operator or "Unknown")
             push_notification(
@@ -1441,11 +1554,19 @@ def complete_transaction():
         }).execute()
         payment_id = resp.data[0]["id"] if resp.data else None
 
-        # ── NOTIFICATION: only fire when record was FOUND in the database ─────
+        # ── NOTIFICATION: only fire when record was FOUND in the database
+        # AND that record was originally submitted through the Online
+        # Request system (see _matches_online_birth_request() /
+        # CIVIL_REGISTRY_REQUEST_TABLE at the top of this file). Processing
+        # an existing birth record directly from the Birth data — with no
+        # matching online request — no longer sends any notification.
+        #
         # CLEANED UP: dropped the stray `connection` positional arg and the
         # `notif_type=` kwarg — push_notification() no longer needs a DB
-        # handle, and record_type is passed the normal way.
-        if payment_status == 'positive':
+        # handle, and record_type is passed the normal way. ──
+        if payment_status == 'positive' and _matches_online_birth_request(
+            first_name, last_name, control_no=payment_reference or None
+        ):
             subject = search_operator or f"{first_name} {last_name}".strip() or "Unknown"
             push_notification(
                 record_type="birth",
@@ -1802,8 +1923,15 @@ def create_payment():
         }).execute()
         payment_id = resp.data[0]["id"] if resp.data else None
 
-        # ── NOTIFICATION: only fire when a matching record exists (positive) ──
-        if payment_status == 'positive':
+        # ── NOTIFICATION: only fire when a matching record exists (positive)
+        # AND that record was originally submitted through the Online
+        # Request system (see _matches_online_birth_request() /
+        # CIVIL_REGISTRY_REQUEST_TABLE at the top of this file). Processing
+        # an existing birth record directly from the Birth data — with no
+        # matching online request — no longer sends any notification. ──
+        if payment_status == 'positive' and _matches_online_birth_request(
+            first_name, last_name, control_no=payment_reference
+        ):
             push_notification(
                 record_type="birth",
                 record_id=birth_record_id,
@@ -3072,9 +3200,17 @@ def complete_transaction():
             return jsonify({"error": "Failed to save transaction."}), 500
         transaction_id = insert_res.data[0]["id"]
 
-        # ── NOTIFICATION: only fire when record was FOUND in the database ─────
+        # ── NOTIFICATION: only fire when record was FOUND in the database
+        # AND that record was originally submitted through the Online
+        # Request system (see _matches_online_marriage_request() /
+        # CIVIL_REGISTRY_REQUEST_TABLE at the top of this file). Processing
+        # an existing marriage record directly from the Marriage data —
+        # with no matching online request — no longer sends any
+        # notification. ──
         record_status_upper = (record_status or "").strip().upper()
-        if record_status_upper in ("ACTIVE", "POSITIVE"):
+        if record_status_upper in ("ACTIVE", "POSITIVE") and _matches_online_marriage_request(
+            groom_full_name, bride_full_name, control_no=payment_reference or None
+        ):
             push_notification(
                 record_type="marriage",
                 record_id=record_id,
