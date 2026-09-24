@@ -1,258 +1,264 @@
 """
-email_service.py - Local Civil Registry, San Carlos City
+routes/email_service.py
+-----------------------
+Best-effort status-update emails for citizen certificate requests.
 
-Sends status-notification emails with the header logos rendered correctly
-in Gmail, Outlook, etc.
+Two ways to send, picked automatically:
 
-TWO IMAGE MODES (set EMAIL_IMAGE_MODE in your .env):
+1. Brevo HTTPS API  — used when BREVO_API_KEY is set. Goes over port 443,
+   so it works on Render's FREE tier, which blocks outbound SMTP ports
+   25/465/587 (that block is why Gmail SMTP hangs there).
+2. Gmail SMTP       — used otherwise (works locally and on Render paid
+   instances).
 
-  cid  (default) Logos are embedded inside the email itself. Works even when
-                 your website is offline or you are testing on localhost.
-                 Put the files in  backend/static/email/  (scc.png, lcr.jpg).
+Environment variables
+  Gmail SMTP:
+    GMAIL_SENDER_EMAIL         the real Gmail address you send from
+    GMAIL_SENDER_APP_PASSWORD  16-char Gmail app password (spaces are OK)
+  Brevo (optional):
+    BREVO_API_KEY              API key from Brevo
+    BREVO_SENDER_EMAIL         a sender verified in Brevo (falls back to
+                               GMAIL_SENDER_EMAIL if not set)
+    BREVO_SENDER_NAME          display name (default "Local Civil Registry")
+  Logos (optional):
+    EMAIL_LOGO_BASE_URL        public URL where scc.png and lcr.jpg are hosted
+                               (default https://civil-registry-scc.vercel.app,
+                               i.e. the files in the frontend's public/ folder)
 
-  url            Logos are loaded from your public website. Needs
-                 PUBLIC_ASSET_URL=https://your-app.vercel.app and the images
-                 placed in the frontend's public/ folder (NOT src/assets/,
-                 because Vite renames those with a hash on every build).
+CHANGED (timeouts): every network call now has a timeout. Before,
+smtplib.SMTP(...) had none, so on a host that silently drops SMTP traffic
+the request just hung until the web worker was killed — which surfaced as
+a 500 on PATCH /api/requests/<id>/status.
 
-REQUIRED .env VALUES:
-  SMTP_HOST=smtp.gmail.com
-  SMTP_PORT=587
-  SMTP_USER=youraddress@gmail.com
-  SMTP_PASSWORD=your-16-char-google-app-password
-  EMAIL_FROM=youraddress@gmail.com            (optional, defaults to SMTP_USER)
-  EMAIL_FROM_NAME=Local Civil Registry        (optional)
-  EMAIL_IMAGE_MODE=cid                        (or url)
-  PUBLIC_ASSET_URL=https://your-app.vercel.app  (only for url mode)
-
-QUICK TEST (run from the backend/ folder):
-  python routes/email_service.py someone@example.com
+CHANGED (logos): status-update emails are now sent as HTML with the
+SCC (scc.png) and Local Civil Registry (lcr.jpg) logos in the header. The
+plain-text version is still included as a fallback for mail clients that
+don't show HTML. The logos must be publicly reachable, so both files live
+in the frontend's public/ folder and are loaded from EMAIL_LOGO_BASE_URL.
 """
 
-import logging
+import json
 import os
 import smtplib
-import sys
-from email.mime.image import MIMEImage
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.utils import formataddr
-from html import escape
-from pathlib import Path
+import socket
+import ssl
+import urllib.error
+import urllib.request
+from email.message import EmailMessage
+from html import escape as _html_escape
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:  # python-dotenv is optional
-    pass
+# Whitespace is trimmed on both values, and spaces are stripped from the app
+# password (Gmail shows it as four groups of four, "abcd efgh ijkl mnop",
+# but SMTP login only accepts the 16 characters without spaces).
+GMAIL_SENDER_EMAIL = (os.environ.get("GMAIL_SENDER_EMAIL") or "").strip()
+GMAIL_SENDER_APP_PASSWORD = (os.environ.get("GMAIL_SENDER_APP_PASSWORD") or "").replace(" ", "").strip()
+SMTP_HOST = (os.environ.get("SMTP_HOST") or "smtp.gmail.com").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT") or 587)
 
-logger = logging.getLogger(__name__)
+BREVO_API_KEY = (os.environ.get("BREVO_API_KEY") or "").strip()
+BREVO_SENDER_EMAIL = (os.environ.get("BREVO_SENDER_EMAIL") or GMAIL_SENDER_EMAIL).strip()
+BREVO_SENDER_NAME = (os.environ.get("BREVO_SENDER_NAME") or "Local Civil Registry").strip()
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
-# ---------------------------------------------------------------- config ---
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "") or SMTP_USER
-EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "Local Civil Registry - San Carlos City")
+# Seconds. Keep these small so a blocked/unreachable server fails fast.
+SMTP_TIMEOUT_SECONDS = 10
+HTTP_TIMEOUT_SECONDS = 10
 
-EMAIL_IMAGE_MODE = os.getenv("EMAIL_IMAGE_MODE", "cid").strip().lower()
-PUBLIC_ASSET_URL = os.getenv("PUBLIC_ASSET_URL", "").strip().rstrip("/")
-
-# backend/static/email/
-ASSET_DIR = Path(__file__).resolve().parent.parent / "static" / "email"
-
-# (content-id, file name, alt text)
-LOGOS = [
-    ("scc_logo", "scc.png", "City of San Carlos seal"),
-    ("lcr_logo", "lcr.jpg", "Local Civil Registry"),
-]
-
-STATUS_COLORS = {
-    "pending review": "#b45309",
-    "pending": "#b45309",
-    "processing": "#1d4ed8",
-    "approved": "#15803d",
-    "ready for pickup": "#15803d",
-    "released": "#15803d",
-    "rejected": "#b91c1c",
-    "declined": "#b91c1c",
-}
-DEFAULT_STATUS_COLOR = "#1e3a8a"
+# Where the logo images are served from. Email clients can't read files
+# from your project folder, so these must be public https URLs. scc.png and
+# lcr.jpg sit in the frontend's public/ folder, which Vercel serves from
+# the site root.
+EMAIL_LOGO_BASE_URL = (
+    os.environ.get("EMAIL_LOGO_BASE_URL") or "https://civil-registry-scc.vercel.app"
+).strip().rstrip("/")
+SCC_LOGO_URL = f"{EMAIL_LOGO_BASE_URL}/scc.png"
+LCR_LOGO_URL = f"{EMAIL_LOGO_BASE_URL}/lcr.jpg"
 
 
-# ---------------------------------------------------------------- images ---
-def _resolve_logos():
+def _build_html_email(subject, body):
+    """Wraps the message in a simple branded HTML layout with both logos.
+
+    Everything the caller supplied is HTML-escaped, so a note typed by staff
+    (e.g. containing < or &) can't break the layout. Uses table layout and
+    inline styles because that's what mail clients render reliably.
     """
-    Returns (logos, attachments)
-      logos:       [{"src": ..., "alt": ...}]  used to build <img> tags
-      attachments: [(cid, Path)]               files to embed (cid mode only)
-    Logos that cannot be found are skipped, so you never get a broken-image icon.
-    """
-    logos, attachments = [], []
+    safe_subject = _html_escape(subject or "")
+    safe_body = _html_escape(body or "").replace("\n", "<br>")
 
-    for cid, filename, alt in LOGOS:
-        if EMAIL_IMAGE_MODE == "url":
-            if not PUBLIC_ASSET_URL:
-                logger.warning("EMAIL_IMAGE_MODE=url but PUBLIC_ASSET_URL is not set; skipping logos.")
-                break
-            logos.append({"src": f"{PUBLIC_ASSET_URL}/{filename}", "alt": alt})
-        else:  # cid
-            path = ASSET_DIR / filename
-            if not path.is_file():
-                logger.warning("Email logo not found: %s (skipped)", path)
-                continue
-            logos.append({"src": f"cid:{cid}", "alt": alt})
-            attachments.append((cid, path))
-
-    return logos, attachments
-
-
-def _attach_inline_image(msg, cid, path):
-    img = MIMEImage(path.read_bytes())
-    img.add_header("Content-ID", f"<{cid}>")
-    img.add_header("Content-Disposition", "inline", filename=path.name)
-    msg.attach(img)
-
-
-# -------------------------------------------------------------- template ---
-def build_status_email(control_no, status, request_type="Marriage Certificate",
-                       recipient_name=None, remarks=None):
-    """Returns (subject, plain_text, html, attachments)."""
-    control_no_h = escape(str(control_no))
-    status_h = escape(str(status))
-    type_h = escape(str(request_type))
-    color = STATUS_COLORS.get(str(status).strip().lower(), DEFAULT_STATUS_COLOR)
-
-    greeting = f"Dear {escape(recipient_name)}," if recipient_name else "Hello,"
-    remarks_html = ""
-    remarks_text = ""
-    if remarks:
-        remarks_html = (
-            '<p style="margin:16px 0 0;padding:12px 14px;background:#f3f4f6;'
-            'border-radius:6px;font-size:14px;color:#374151;">'
-            f"<strong>Remarks:</strong> {escape(remarks)}</p>"
-        )
-        remarks_text = f"\nRemarks: {remarks}\n"
-
-    logos, attachments = _resolve_logos()
-    logo_cells = "".join(
-        f'<td style="padding:0 8px;"><img src="{l["src"]}" alt="{escape(l["alt"])}" '
-        f'width="80" height="80" style="display:block;border:0;width:80px;height:80px;'
-        f'object-fit:contain;"></td>'
-        for l in logos
-    )
-    logo_row = (
-        f'<table role="presentation" align="center" cellpadding="0" cellspacing="0" '
-        f'style="margin:0 auto 12px;"><tr>{logo_cells}</tr></table>'
-        if logo_cells else ""
-    )
-
-    subject = f"{request_type} Request - {status}"
-
-    html = f"""<!DOCTYPE html>
-<html>
-<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;">
-    <tr><td align="center">
-      <table role="presentation" width="600" cellpadding="0" cellspacing="0"
-             style="max-width:600px;width:100%;background:#ffffff;border-radius:10px;padding:28px;">
-        <tr><td align="center">
-          {logo_row}
-          <div style="font-size:20px;font-weight:bold;color:#111827;">Local Civil Registry</div>
-          <div style="font-size:14px;color:#6b7280;margin-top:2px;">San Carlos City</div>
-          <hr style="border:0;border-top:1px solid #e5e7eb;margin:20px 0;">
-        </td></tr>
-        <tr><td style="color:#111827;font-size:16px;line-height:1.5;">
-          <h2 style="margin:0 0 14px;font-size:22px;">{type_h} Request &mdash; {status_h}</h2>
-          <p style="margin:0 0 10px;">{greeting}</p>
-          <p style="margin:0;">Your {type_h.lower()} request
-             (Control No: <strong>{control_no_h}</strong>) is now:
-             <span style="display:inline-block;padding:3px 10px;border-radius:12px;
-                          background:{color};color:#ffffff;font-size:14px;font-weight:bold;">{status_h}</span>
-          </p>
-          {remarks_html}
-          <p style="margin:24px 0 0;font-size:12px;color:#9ca3af;">
-            This is an automated message from the Local Civil Registry, San Carlos City.
-            Please do not reply to this email.
-          </p>
-        </td></tr>
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{safe_subject}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f1f5f9;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f1f5f9;padding:24px 12px;">
+  <tr>
+    <td align="center">
+      <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:560px;background-color:#ffffff;border:1px solid #e2e8f0;border-radius:12px;">
+        <tr>
+          <td align="center" style="padding:28px 24px 8px 24px;">
+            <img src="{SCC_LOGO_URL}" alt="San Carlos City" height="72" style="display:inline-block;border:0;height:72px;width:auto;margin:0 8px;">
+            <img src="{LCR_LOGO_URL}" alt="Local Civil Registry" height="72" style="display:inline-block;border:0;height:72px;width:auto;margin:0 8px;">
+          </td>
+        </tr>
+        <tr>
+          <td align="center" style="padding:4px 24px 16px 24px;font-family:Arial,Helvetica,sans-serif;">
+            <div style="font-size:16px;font-weight:bold;color:#0f172a;">Local Civil Registry</div>
+            <div style="font-size:13px;color:#64748b;">San Carlos City</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:0 24px;">
+            <div style="border-top:1px solid #e2e8f0;font-size:0;line-height:0;">&nbsp;</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 28px 8px 28px;font-family:Arial,Helvetica,sans-serif;">
+            <h2 style="margin:0 0 12px 0;font-size:18px;color:#0f172a;">{safe_subject}</h2>
+            <p style="margin:0;font-size:15px;line-height:1.6;color:#334155;">{safe_body}</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 28px 28px 28px;font-family:Arial,Helvetica,sans-serif;">
+            <p style="margin:0;font-size:12px;line-height:1.5;color:#94a3b8;">This is an automated message from the Local Civil Registry, San Carlos City.</p>
+          </td>
+        </tr>
       </table>
-    </td></tr>
-  </table>
+    </td>
+  </tr>
+</table>
 </body>
 </html>"""
 
-    text = (
-        f"{'Dear ' + recipient_name + ',' if recipient_name else 'Hello,'}\n\n"
-        f"Your {request_type.lower()} request (Control No: {control_no}) is now: {status}.\n"
-        f"{remarks_text}\n"
-        "This is an automated message from the Local Civil Registry, San Carlos City."
+
+def _send_via_brevo(to_email, subject, body):
+    """Send through Brevo's HTTPS API. Returns True/False, never raises."""
+    if "@" not in BREVO_SENDER_EMAIL:
+        print(
+            "[email_service] BREVO_API_KEY is set but BREVO_SENDER_EMAIL "
+            f"(or GMAIL_SENDER_EMAIL) is not a valid address (got: {BREVO_SENDER_EMAIL!r}) "
+            "— skipping email notification."
+        )
+        return False
+
+    payload = json.dumps({
+        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": _build_html_email(subject, body),
+        "textContent": body,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        BREVO_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
     )
-
-    return subject, text, html, attachments
-
-
-# --------------------------------------------------------------- sending ---
-def send_email(to_email, subject, text, html, attachments=None):
-    """Low-level sender. Returns True on success, False on failure."""
-    if not (SMTP_USER and SMTP_PASSWORD):
-        logger.error("SMTP_USER / SMTP_PASSWORD are not configured.")
-        return False
-    if not to_email:
-        logger.error("No recipient email address given.")
-        return False
-
-    # multipart/related  ->  holds the HTML body + the inline images
-    #   multipart/alternative -> plain text + HTML versions
-    msg = MIMEMultipart("related")
-    msg["Subject"] = subject
-    msg["From"] = formataddr((EMAIL_FROM_NAME, EMAIL_FROM))
-    msg["To"] = to_email
-
-    alt = MIMEMultipart("alternative")
-    alt.attach(MIMEText(text, "plain", "utf-8"))
-    alt.attach(MIMEText(html, "html", "utf-8"))
-    msg.attach(alt)
-
-    for cid, path in (attachments or []):
-        _attach_inline_image(msg, cid, path)
 
     try:
-        if SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20)
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+            ok = 200 <= resp.status < 300
+        if ok:
+            print(f"[email_service] Status-update email sent to {to_email} (Brevo)")
         else:
-            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
-            server.starttls()
-        with server:
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(EMAIL_FROM, [to_email], msg.as_string())
-        logger.info("Email sent to %s (%s)", to_email, subject)
-        return True
-    except Exception:
-        logger.exception("Failed to send email to %s", to_email)
+            print(f"[email_service] Brevo returned unexpected status {resp.status} for {to_email}")
+        return ok
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        print(f"[email_service] Brevo rejected the email to {to_email}: HTTP {e.code} {detail}")
+        return False
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        print(f"[email_service] Could not reach Brevo (timeout/network): {e}")
+        return False
+    except Exception as e:
+        print(f"[email_service] Unexpected error sending via Brevo to {to_email}: {e}")
         return False
 
 
-def send_status_email(to_email, control_no, status, request_type="Marriage Certificate",
-                      recipient_name=None, remarks=None):
+def _send_via_gmail_smtp(to_email, subject, body):
+    """Send through Gmail SMTP. Returns True/False, never raises."""
+    if not GMAIL_SENDER_EMAIL:
+        print("[email_service] GMAIL_SENDER_EMAIL not set — skipping email notification.")
+        return False
+
+    # Catch the misconfiguration where the app password (with spaces) was
+    # pasted into GMAIL_SENDER_EMAIL instead of a real address.
+    if "@" not in GMAIL_SENDER_EMAIL:
+        print(
+            "[email_service] GMAIL_SENDER_EMAIL does not look like an email "
+            f"address (got: {GMAIL_SENDER_EMAIL!r}). Set it to the real Gmail "
+            "address you're sending from, and put the app password in "
+            "GMAIL_SENDER_APP_PASSWORD instead — skipping email notification."
+        )
+        return False
+
+    if not GMAIL_SENDER_APP_PASSWORD:
+        print("[email_service] GMAIL_SENDER_APP_PASSWORD not set — skipping email notification.")
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = GMAIL_SENDER_EMAIL
+    msg["To"] = to_email
+    msg.set_content(body)
+    msg.add_alternative(_build_html_email(subject, body), subtype="html")
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+            server.starttls(context=context)
+            server.login(GMAIL_SENDER_EMAIL, GMAIL_SENDER_APP_PASSWORD)
+            server.send_message(msg)
+        print(f"[email_service] Status-update email sent to {to_email}")
+        return True
+    except smtplib.SMTPAuthenticationError as e:
+        print(
+            "[email_service] Gmail rejected the login. Check GMAIL_SENDER_EMAIL / "
+            f"GMAIL_SENDER_APP_PASSWORD (needs a Google app password, 2-Step Verification on): {e}"
+        )
+        return False
+    except (socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+        print(
+            f"[email_service] Could not connect to {SMTP_HOST}:{SMTP_PORT} within "
+            f"{SMTP_TIMEOUT_SECONDS}s ({e}). If this runs on Render's free tier, outbound "
+            "SMTP ports 25/465/587 are blocked — set BREVO_API_KEY to send over HTTPS "
+            "instead, or upgrade the instance."
+        )
+        return False
+    except Exception as e:
+        print(f"[email_service] Failed to send status-update email to {to_email}: {e}")
+        return False
+
+
+def send_status_update_email(to_email, subject, body):
     """
-    Main function your routes should call, e.g.
+    Sends an email (HTML with logos, plus a plain-text fallback) to `to_email`.
 
-        from routes.email_service import send_status_email
-        send_status_email(citizen_email, "MR-20260923-00019", "Pending Review")
+    Returns True on success, False otherwise. Never raises — treat this
+    as best-effort so a status update still succeeds even if email
+    sending fails or isn't configured.
     """
-    subject, text, html, attachments = build_status_email(
-        control_no, status, request_type, recipient_name, remarks
-    )
-    return send_email(to_email, subject, text, html, attachments)
+    if not to_email:
+        print("[email_service] No requester_email on file for this request — skipping email notification.")
+        return False
 
-
-# ------------------------------------------------------------- self-test ---
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    if len(sys.argv) < 2:
-        print("Usage: python routes/email_service.py recipient@example.com")
-        sys.exit(1)
-    ok = send_status_email(sys.argv[1], "MR-20260923-00019", "Pending Review")
-    print("Sent!" if ok else "Failed - check the log above.")
+    try:
+        if BREVO_API_KEY:
+            return _send_via_brevo(to_email, subject, body)
+        return _send_via_gmail_smtp(to_email, subject, body)
+    except Exception as e:
+        # Belt and braces: nothing above should raise, but this function's
+        # contract is that it never does.
+        print(f"[email_service] Unexpected error: {e}")
+        return False
