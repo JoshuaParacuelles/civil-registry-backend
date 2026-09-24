@@ -42,6 +42,26 @@ CHANGED (fix for HTTP 500 on PATCH /api/requests/<id>/status):
     the server log) instead of a generic error.
   * Fixed has_signature in the detail endpoint: it used to read
     signature_path AFTER popping it, so it was always False.
+
+CHANGED (fix: notify-channel selection was never actually applied):
+  * The frontend's "Notify requester via" control already sends
+    `notify_via` ("email" | "sms" | "both" | "none") in the PATCH body,
+    but this endpoint used to ignore it completely and always attempted
+    BOTH email and SMS regardless of what was picked — so the toggle in
+    the UI didn't do anything server-side, and the success message never
+    said which address/number was actually used.
+  * `notify_via` is now read from the request body (defaulting to
+    "both" for older clients that don't send it) and used to decide
+    which channel(s) actually get a `to_email`/`to_number` — the
+    channel(s) not selected are skipped rather than silently sent
+    anyway.
+  * The response's `message` (what the admin's success/notice toast
+    displays) now includes the actual email address and/or phone number
+    that was notified, e.g. "Citizen notified by SMS (09106616369)."
+    instead of a generic "Citizen notified by SMS." with no identifying
+    text/number. The JSON response also now includes `notify_via`,
+    `notified_email`, and `notified_phone` for anything else that wants
+    the raw values.
 """
 
 import time
@@ -70,6 +90,11 @@ STATUS_LABELS = {
     "REJECTED": "Rejected",
 }
 ALL_STATUSES = list(STATUS_LABELS.keys())
+
+# Valid values for the "notify_via" field the frontend's channel toggle
+# sends. Anything else (including a missing/old client that doesn't send
+# it at all) falls back to "both", matching the previous behavior.
+VALID_NOTIFY_VIA = {"email", "sms", "both", "none"}
 
 # Permission key the frontend checks via hasAccess("citizen_requests").
 # An admin (is_admin() == True) always passes regardless of this list.
@@ -114,6 +139,12 @@ def who(kind, r):
 
 def _send_notifications(to_email, subject, body, to_number, sms_message):
     """Send the email and SMS in parallel, with a hard overall timeout.
+
+    Pass `to_email=None` and/or `to_number=None` to skip that channel
+    entirely (used when notify_via didn't select it) — both
+    send_status_update_email and send_status_update_sms already treat a
+    missing/empty recipient as "skip, don't send" and simply return
+    False, so this is safe without changing either of those functions.
 
     Returns (email_sent, sms_sent) as plain booleans. NEVER raises: a
     timeout or an exception in either channel is logged and counted as
@@ -249,6 +280,13 @@ def update_citizen_request_status(record_id):
     new_status = (data.get("status") or "").strip().upper()
     note = (data.get("note") or "").strip() or None
 
+    # Which channel(s) the admin picked in the "Notify requester via"
+    # control. Missing/unrecognized values fall back to "both", which is
+    # what this endpoint always did before that control existed.
+    notify_via = (data.get("notify_via") or "").strip().lower()
+    if notify_via not in VALID_NOTIFY_VIA:
+        notify_via = "both"
+
     if new_status not in ALL_STATUSES:
         return jsonify({"error": f"Invalid status. Must be one of: {', '.join(ALL_STATUSES)}"}), 400
 
@@ -281,26 +319,37 @@ def update_citizen_request_status(record_id):
         if note:
             message += f" Note: {note}"
 
-        # ── 2. Email + SMS, in parallel, with a hard timeout. Never raises. ──
+        # ── 2. Email + SMS, in parallel, with a hard timeout. Never raises.
+        #       Only the channel(s) selected via notify_via get an actual
+        #       recipient — the other(s) get None, which both send
+        #       functions already treat as "skip, nothing to send". ──
         requester_email = row.get("requester_email")
         requester_phone = row.get("requester_telephone")
 
-        email_sent, sms_sent = _send_notifications(
-            to_email=requester_email,
-            subject=f"{kind.title()} Certificate Request — {status_label}",
-            body=message,
-            to_number=requester_phone,
-            sms_message=message,
-        )
+        send_to_email = requester_email if notify_via in ("email", "both") else None
+        send_to_phone = requester_phone if notify_via in ("sms", "both") else None
+
+        if notify_via == "none":
+            email_sent, sms_sent = False, False
+        else:
+            email_sent, sms_sent = _send_notifications(
+                to_email=send_to_email,
+                subject=f"{kind.title()} Certificate Request — {status_label}",
+                body=message,
+                to_number=send_to_phone,
+                sms_message=message,
+            )
 
         notified_via = []
         if email_sent:
-            notified_via.append("email")
+            notified_via.append(f"email ({requester_email})")
         if sms_sent:
-            notified_via.append("SMS")
+            notified_via.append(f"SMS ({requester_phone})")
 
         if notified_via:
             notify_status_message = f"Status updated. Citizen notified by {' and '.join(notified_via)}."
+        elif notify_via == "none":
+            notify_status_message = "Status updated. No notification was sent (none selected)."
         elif not requester_email and not requester_phone:
             notify_status_message = "Status updated, but no email or phone number is on file for this request — citizen was not notified."
         else:
@@ -317,6 +366,7 @@ def update_citizen_request_status(record_id):
                 "old_status": old_status,
                 "new_status": new_status,
                 "note": note,
+                "notify_via": notify_via,
                 "email_sent": email_sent,
                 "sms_sent": sms_sent,
             },
@@ -331,8 +381,11 @@ def update_citizen_request_status(record_id):
             "status": new_status,
             "status_label": status_label,
             "updated_at": now_iso,
+            "notify_via": notify_via,
             "email_sent": email_sent,
             "sms_sent": sms_sent,
+            "notified_email": requester_email if email_sent else None,
+            "notified_phone": requester_phone if sms_sent else None,
             "message": notify_status_message,
         })
     except Exception as e:
