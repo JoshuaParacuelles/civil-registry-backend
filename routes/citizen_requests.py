@@ -16,8 +16,7 @@ Swap _staff_required() below for a proper permission-based decorator
 once one is available.
 
 Status updates email the citizen at the address they gave on the request
-form (`requester_email`) via email_service.send_status_update_email, and
-text them at `requester_telephone` via sms_service.send_status_update_sms.
+form (`requester_email`) via email_service.send_status_update_email.
 No row is written to `notification` for a status update, so the admin
 bell stays quiet for these.
 
@@ -25,16 +24,16 @@ Only Pending Review, Being Processed, and Completed are selectable
 statuses (REJECTED remains available as a separate terminal state).
 
 CHANGED (fix for HTTP 500 on PATCH /api/requests/<id>/status):
-  * The email / SMS / audit-log steps used to run inline, one after the
+  * The email / audit-log steps used to run inline, one after the
     other, inside the same try/except that returns a 500. If any of them
     hung (Render's free tier blocks outbound SMTP ports 25/465/587, so
     smtplib waited on a connection that never came, until the gunicorn
-    worker was killed) or raised (e.g. sms_service or record_action
-    throwing), the citizen-facing update looked like it failed even
-    though the DB row had already been saved.
-  * Email and SMS now run in parallel worker threads with a hard overall
-    timeout (NOTIFY_TIMEOUT_SECONDS). A timeout or exception in either
-    just counts as "not sent" — it can never turn into a 500.
+    worker was killed) or raised (e.g. record_action throwing), the
+    citizen-facing update looked like it failed even though the DB row
+    had already been saved.
+  * Email now runs in a worker thread with a hard timeout
+    (NOTIFY_TIMEOUT_SECONDS). A timeout or exception there just counts
+    as "not sent" — it can never turn into a 500.
   * The audit-log write is wrapped separately so a logging problem can't
     fail the request either.
   * The DB update has its own try/except, so if the save itself fails
@@ -43,28 +42,26 @@ CHANGED (fix for HTTP 500 on PATCH /api/requests/<id>/status):
   * Fixed has_signature in the detail endpoint: it used to read
     signature_path AFTER popping it, so it was always False.
 
-CHANGED (fix: notify-channel selection was never actually applied):
-  * The frontend's "Notify requester via" control already sends
-    `notify_via` ("email" | "sms" | "both" | "none") in the PATCH body,
-    but this endpoint used to ignore it completely and always attempted
-    BOTH email and SMS regardless of what was picked — so the toggle in
-    the UI didn't do anything server-side, and the success message never
-    said which address/number was actually used.
-  * `notify_via` is now read from the request body (defaulting to
-    "both" for older clients that don't send it) and used to decide
-    which channel(s) actually get a `to_email`/`to_number` — the
-    channel(s) not selected are skipped rather than silently sent
-    anyway.
+CHANGED (notify-channel selection):
+  * The frontend's "Notify requester via" control sends `notify_via` in
+    the PATCH body; the endpoint reads it and only notifies when the
+    channel was actually selected.
   * The response's `message` (what the admin's success/notice toast
-    displays) now includes the actual email address and/or phone number
-    that was notified, e.g. "Citizen notified by SMS (09106616369)."
-    instead of a generic "Citizen notified by SMS." with no identifying
-    text/number. The JSON response also now includes `notify_via`,
-    `notified_email`, and `notified_phone` for anything else that wants
-    the raw values.
+    displays) includes the actual email address that was notified.
+
+CHANGED (SMS removed — email only):
+  * Semaphore SMS is a paid, prepaid service, so SMS notifications have
+    been dropped. sms_service.py is no longer imported or used here (the
+    file can be deleted, along with the SEMAPHORE_API_KEY /
+    SEMAPHORE_SENDER_NAME environment variables).
+  * `notify_via` now only accepts "email" or "none". Anything else —
+    including "sms" / "both" from an older cached frontend, or a missing
+    value — falls back to "email".
+  * The response no longer contains `sms_sent` or `notified_phone`.
+  * The requester's phone number is still stored, listed and returned
+    everywhere else exactly as before; it just isn't texted.
 """
 
-import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
@@ -75,7 +72,6 @@ from flask import Blueprint, request, jsonify, session
 from supabase_client import supabase
 from auth.Rolemanagement import is_admin, get_user_permissions
 from .email_service import send_status_update_email
-from .sms_service import send_status_update_sms
 from logs.Audits import record_action
 
 citizen_requests_bp = Blueprint("citizen_requests_bp", __name__)
@@ -91,18 +87,18 @@ STATUS_LABELS = {
 }
 ALL_STATUSES = list(STATUS_LABELS.keys())
 
-# Valid values for the "notify_via" field the frontend's channel toggle
-# sends. Anything else (including a missing/old client that doesn't send
-# it at all) falls back to "both", matching the previous behavior.
-VALID_NOTIFY_VIA = {"email", "sms", "both", "none"}
+# Valid values for the "notify_via" field the frontend sends. Anything
+# else (including a missing/old client, or a stale "sms"/"both" value)
+# falls back to "email".
+VALID_NOTIFY_VIA = {"email", "none"}
 
 # Permission key the frontend checks via hasAccess("citizen_requests").
 # An admin (is_admin() == True) always passes regardless of this list.
 REQUIRED_PERMISSION = "citizen_requests"
 
-# Max total time (seconds) to wait for email + SMS together before giving
-# up on them. Keep this comfortably below your gunicorn --timeout (30s by
-# default) so the request always finishes and returns JSON.
+# Max time (seconds) to wait for the email before giving up on it. Keep
+# this comfortably below your gunicorn --timeout (30s by default) so the
+# request always finishes and returns JSON.
 NOTIFY_TIMEOUT_SECONDS = 15
 
 
@@ -137,53 +133,38 @@ def who(kind, r):
     return f"{r.get(p + '_firstname') or ''} {r.get(p + '_surname') or ''}".strip()
 
 
-def _send_notifications(to_email, subject, body, to_number, sms_message):
-    """Send the email and SMS in parallel, with a hard overall timeout.
+def _send_email_notification(to_email, subject, body):
+    """Send the status-update email in a worker thread, with a hard timeout.
 
-    Pass `to_email=None` and/or `to_number=None` to skip that channel
-    entirely (used when notify_via didn't select it) — both
-    send_status_update_email and send_status_update_sms already treat a
-    missing/empty recipient as "skip, don't send" and simply return
-    False, so this is safe without changing either of those functions.
+    send_status_update_email already treats a missing/empty recipient as
+    "skip, don't send" and simply returns False.
 
-    Returns (email_sent, sms_sent) as plain booleans. NEVER raises: a
-    timeout or an exception in either channel is logged and counted as
-    "not sent", so it can't break the status update.
+    Returns a plain boolean. NEVER raises: a timeout or an exception is
+    logged and counted as "not sent", so it can't break the status update.
     """
-    executor = ThreadPoolExecutor(max_workers=2)
-    futures = {
-        "email": executor.submit(
-            send_status_update_email,
-            to_email=to_email,
-            subject=subject,
-            body=body,
-        ),
-        "sms": executor.submit(
-            send_status_update_sms,
-            to_number=to_number,
-            message=sms_message,
-        ),
-    }
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        send_status_update_email,
+        to_email=to_email,
+        subject=subject,
+        body=body,
+    )
 
-    results = {"email": False, "sms": False}
-    deadline = time.monotonic() + NOTIFY_TIMEOUT_SECONDS
-
-    for name, fut in futures.items():
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            results[name] = bool(fut.result(timeout=remaining))
-        except FuturesTimeout:
-            print(
-                f"[citizen_requests] {name} notification did not finish within "
-                f"{NOTIFY_TIMEOUT_SECONDS}s — giving up on it (status update is unaffected)."
-            )
-        except Exception as e:
-            print(f"[citizen_requests] {name} notification raised: {e}")
-            traceback.print_exc()
+    sent = False
+    try:
+        sent = bool(future.result(timeout=NOTIFY_TIMEOUT_SECONDS))
+    except FuturesTimeout:
+        print(
+            f"[citizen_requests] email notification did not finish within "
+            f"{NOTIFY_TIMEOUT_SECONDS}s — giving up on it (status update is unaffected)."
+        )
+    except Exception as e:
+        print(f"[citizen_requests] email notification raised: {e}")
+        traceback.print_exc()
 
     # Don't block on a worker that's still stuck on a dead connection.
     executor.shutdown(wait=False)
-    return results["email"], results["sms"]
+    return sent
 
 
 def _safe_record_action(*args, **kwargs):
@@ -280,12 +261,13 @@ def update_citizen_request_status(record_id):
     new_status = (data.get("status") or "").strip().upper()
     note = (data.get("note") or "").strip() or None
 
-    # Which channel(s) the admin picked in the "Notify requester via"
-    # control. Missing/unrecognized values fall back to "both", which is
-    # what this endpoint always did before that control existed.
+    # Whether the admin wants the requester emailed. Only "email" or
+    # "none" are valid now; missing/unrecognized values (including a
+    # stale "sms" or "both" from an older cached frontend) fall back to
+    # "email".
     notify_via = (data.get("notify_via") or "").strip().lower()
     if notify_via not in VALID_NOTIFY_VIA:
-        notify_via = "both"
+        notify_via = "email"
 
     if new_status not in ALL_STATUSES:
         return jsonify({"error": f"Invalid status. Must be one of: {', '.join(ALL_STATUSES)}"}), 400
@@ -319,41 +301,26 @@ def update_citizen_request_status(record_id):
         if note:
             message += f" Note: {note}"
 
-        # ── 2. Email + SMS, in parallel, with a hard timeout. Never raises.
-        #       Only the channel(s) selected via notify_via get an actual
-        #       recipient — the other(s) get None, which both send
-        #       functions already treat as "skip, nothing to send". ──
+        # ── 2. Email, in a worker thread, with a hard timeout. Never raises. ──
         requester_email = row.get("requester_email")
-        requester_phone = row.get("requester_telephone")
-
-        send_to_email = requester_email if notify_via in ("email", "both") else None
-        send_to_phone = requester_phone if notify_via in ("sms", "both") else None
 
         if notify_via == "none":
-            email_sent, sms_sent = False, False
+            email_sent = False
         else:
-            email_sent, sms_sent = _send_notifications(
-                to_email=send_to_email,
+            email_sent = _send_email_notification(
+                to_email=requester_email,
                 subject=f"{kind.title()} Certificate Request — {status_label}",
                 body=message,
-                to_number=send_to_phone,
-                sms_message=message,
             )
 
-        notified_via = []
         if email_sent:
-            notified_via.append(f"email ({requester_email})")
-        if sms_sent:
-            notified_via.append(f"SMS ({requester_phone})")
-
-        if notified_via:
-            notify_status_message = f"Status updated. Citizen notified by {' and '.join(notified_via)}."
+            notify_status_message = f"Status updated. Citizen notified by email ({requester_email})."
         elif notify_via == "none":
             notify_status_message = "Status updated. No notification was sent (none selected)."
-        elif not requester_email and not requester_phone:
-            notify_status_message = "Status updated, but no email or phone number is on file for this request — citizen was not notified."
+        elif not requester_email:
+            notify_status_message = "Status updated, but no email address is on file for this request — citizen was not notified."
         else:
-            notify_status_message = "Status updated, but the notification (email/SMS) failed to send. Check server logs."
+            notify_status_message = "Status updated, but the email notification failed to send. Check server logs."
 
         # ── 3. Audit log (best-effort). ──
         _safe_record_action(
@@ -368,7 +335,6 @@ def update_citizen_request_status(record_id):
                 "note": note,
                 "notify_via": notify_via,
                 "email_sent": email_sent,
-                "sms_sent": sms_sent,
             },
             ip=request.remote_addr,
         )
@@ -383,9 +349,7 @@ def update_citizen_request_status(record_id):
             "updated_at": now_iso,
             "notify_via": notify_via,
             "email_sent": email_sent,
-            "sms_sent": sms_sent,
             "notified_email": requester_email if email_sent else None,
-            "notified_phone": requester_phone if sms_sent else None,
             "message": notify_status_message,
         })
     except Exception as e:
