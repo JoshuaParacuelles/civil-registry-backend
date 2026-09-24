@@ -1,19 +1,44 @@
-# Environment variables — never commit real secrets
+# ---------- Environment variables: never commit real secrets ----------
 .env
+.env.*
+!.env.example
 
-# Python
+# ---------- Python ----------
 __pycache__/
 *.pyc
 *.pyo
 venv/
 .venv/
 
-# Node / React
+# ---------- Node / React ----------
 node_modules/
 build/
 dist/
+.vercel/
 
-# OS / editor junk
+# ---------- Backend runtime data ----------
+flask_session/
+backend/uploads/
+backend/routes/uploads/
+backend/_quarantine/
+backend/keep.txt
+*.log
+
+# ---------- Local databases (user accounts, roles, password hashes) ----------
+# NOTE: your login/role code still reads backend/auth/users.db and roles.db.
+# If your deployed backend depends on these files being in the repo, ignoring
+# them means a fresh deploy starts with NO users. Seed them with a script on
+# the server (or move auth to Supabase) before untracking.
+*.db
+*.sqlite3
+
+# ---------- One-off admin helpers ----------
+# Uncomment if these contain real or hardcoded passwords:
+# backend/fix_admin_password.py
+# backend/auth/fix_password.py
+
+# ---------- OS / editor junk ----------
 .DS_Store
 Thumbs.db
 .vscode/
+.idea/

@@ -1,37 +1,55 @@
 """
 routes/notification.py
 -----------------------
-Notification system, converted from MySQL to Supabase.
+Notification system (admin bell + SSE stream), backed by Supabase.
 
 Table used (see notification_schema.sql):
     id, record_type ('birth'|'death'|'marriage'), record_id,
     control_no, title, message, request_snapshot jsonb,
     is_read, created_at, read_at, read_by
 
-CHANGE FROM DEATH/MARRIAGE CONVERSION PATTERN:
-    push_notification() used to take a MySQL `conn` as its first arg and
-    require `title`. Callers (birth.py in particular) were already calling
-    it with a stray `connection` positional arg, no `title`, and an extra
-    `notif_type=` kwarg that never existed in the old signature — that call
-    path would have raised TypeError the moment it actually ran. The new
-    signature below absorbs all of that via *args/**kwargs so nothing
-    breaks, but the call sites in birth.py have been cleaned up to the
-    correct form; consider doing the same anywhere else this is called.
+NOTE: this module only handles the IN-APP notifications (bell icon / live
+stream). It does NOT send emails or SMS. Those are sent from
+routes/email_service.py and routes/sms_service.py, called by
+routes/citizen_requests.py.
+
+CHANGES IN THIS VERSION (behavior is otherwise identical):
+  1. Boolean filters now go through _bool_filter() ("true"/"false" strings),
+     the same convention used in birth/marriage/death routes, instead of
+     passing raw Python bools into .eq().
+  2. push_notification() no longer RAISES on a bad record_type. It logs and
+     returns None. Callers invoke it after the transaction is already saved,
+     so raising turned a notification problem into a 500 for the user.
+  3. Optional login protection (NOTIFICATIONS_REQUIRE_LOGIN=1). Off by
+     default so nothing breaks until the frontend sends cookies.
+  4. SSE CORS origin is configurable (SSE_ALLOW_ORIGIN) instead of a
+     hardcoded "*". Default is still "*" so current behavior is unchanged.
+  5. mark_read rejects booleans in the ids list.
+
+ENV VARIABLES (all optional):
+  NOTIFICATIONS_REQUIRE_LOGIN=1   require session["username"] on every route
+  SSE_ALLOW_ORIGIN=https://your-app.vercel.app   lock the SSE stream to your site
 """
 
 import json
+import logging
+import os
 import queue
 import threading
 import time
 from datetime import datetime, timezone
 
-from flask import Blueprint, Response, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request, session
 
-from supabase_client import supabase  # NOTE: adjust import if your Supabase client lives elsewhere
+from supabase_client import supabase
 
 notifications_bp = Blueprint("notifications", __name__)
 
-# ─── SSE subscriber registry (unchanged — pure in-memory, no DB involved) ────
+_module_logger = logging.getLogger(__name__)
+
+VALID_RECORD_TYPES = ("birth", "death", "marriage")
+
+# ─── SSE subscriber registry (pure in-memory, no DB involved) ────────────────
 _lock:        threading.Lock   = threading.Lock()
 _subscribers: set[queue.Queue] = set()
 
@@ -39,6 +57,18 @@ _subscribers: set[queue.Queue] = set()
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERNAL HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _log_error(msg: str, *args) -> None:
+    try:
+        current_app.logger.error(msg, *args)
+    except RuntimeError:  # outside an app context
+        _module_logger.error(msg, *args)
+
+
+def _bool_filter(value: bool) -> str:
+    """PostgREST-safe lowercase boolean for .eq() filters."""
+    return "true" if value else "false"
+
 
 def _broadcast(payload: dict) -> None:
     """Push a JSON payload to every live SSE subscriber."""
@@ -55,7 +85,7 @@ def _broadcast(payload: dict) -> None:
 
 
 def _broadcast_keepalive() -> None:
-    """Send SSE comment keepalive to all subscribers (no event emitted on client)."""
+    """Send an SSE comment keepalive to all subscribers."""
     msg = ": keepalive\n\n"
     with _lock:
         dead: set[queue.Queue] = set()
@@ -95,7 +125,7 @@ def _coerce_datetime(value):
 
 
 def _parse_snapshot(raw) -> dict | None:
-    """Supabase returns jsonb columns already parsed as dicts, but stay defensive."""
+    """Supabase returns jsonb already parsed, but stay defensive."""
     if raw is None:
         return None
     if isinstance(raw, dict):
@@ -131,10 +161,28 @@ def _row_to_payload(row: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# OPTIONAL LOGIN GUARD
+#
+# Off by default. Turn on with NOTIFICATIONS_REQUIRE_LOGIN=1 once your
+# frontend sends cookies with these requests:
+#   fetch(url, { credentials: "include" })
+#   new EventSource(url, { withCredentials: true })
+# and the backend CORS config allows credentials for your frontend origin.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@notifications_bp.before_request
+def _require_login():
+    if os.getenv("NOTIFICATIONS_REQUIRE_LOGIN", "0") != "1":
+        return None
+    if request.method == "OPTIONS":
+        return None
+    if session.get("username"):
+        return None
+    return jsonify({"success": False, "error": "Authentication required"}), 401
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BACKGROUND KEEPALIVE THREAD
-# Sends SSE keepalive pings every 25s so proxies don't close idle connections.
-# (The old MySQL "gone away" ping is gone — Supabase's REST client doesn't
-# hold a long-lived connection that can go stale like that.)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _keepalive_started = False
@@ -142,7 +190,7 @@ _keepalive_lock    = threading.Lock()
 
 
 def _start_keepalive_thread(app):
-    """Call once after app startup. Safe to call multiple times — idempotent."""
+    """Call once after app startup. Safe to call multiple times."""
     global _keepalive_started
     with _keepalive_lock:
         if _keepalive_started:
@@ -172,16 +220,18 @@ def push_notification(
     control_no:       str | None = None,
     title:            str | None = None,
     message:          str = "",
-    notif_type:       str | None = None,    # legacy alias some call sites used instead of record_type
+    notif_type:       str | None = None,   # legacy alias for record_type
     request_snapshot: dict | None = None,
     **kwargs,
 ) -> int | None:
     """
-    Insert a row into `notification` (Supabase) and broadcast it via SSE instantly.
+    Insert a row into `notification` and broadcast it via SSE.
 
-    Tolerant of legacy call shapes: a leftover positional `connection` arg
-    (from the MySQL days) is silently ignored via *args, and `notif_type=`
-    is accepted as an alias for `record_type=`.
+    Never raises: a notification failure must not break the transaction that
+    triggered it. Returns the new notification id, or None on failure.
+
+    Tolerant of legacy call shapes: a leftover positional `connection` arg is
+    ignored via *args, and `notif_type=` works as an alias for `record_type=`.
 
     Usage:
         from routes.notification import push_notification
@@ -190,14 +240,17 @@ def push_notification(
             record_type="birth",
             record_id=record_id,
             control_no=control_no,
-            title="New Request",
-            message="A new birth request was submitted.",
-            request_snapshot={"requestor_name": "Juan Dela Cruz", ...},
+            title="Birth Certificate Issued",
+            message="Birth certificate issued for 'Juan Dela Cruz'",
         )
     """
     record_type = (record_type or notif_type or "").lower()
-    if record_type not in ("birth", "death", "marriage"):
-        raise ValueError(f"record_type must be birth/death/marriage, got: {record_type!r}")
+    if record_type not in VALID_RECORD_TYPES:
+        _log_error(
+            "push_notification skipped: record_type must be one of %s, got %r",
+            VALID_RECORD_TYPES, record_type,
+        )
+        return None
 
     if not title:
         title = (message[:60] if message else "Notification")
@@ -216,7 +269,7 @@ def push_notification(
         new_id     = row.get("id")
         created_at = row.get("created_at") or datetime.now(timezone.utc).isoformat()
 
-        payload = {
+        _broadcast({
             "id":          new_id,
             "record_type": record_type,
             "record_id":   record_id,
@@ -229,15 +282,11 @@ def push_notification(
             "time":        "Just now",
             "created_at":  created_at,
             "read_at":     None,
-        }
-        _broadcast(payload)
+        })
         return new_id
 
     except Exception as exc:
-        try:
-            current_app.logger.error("push_notification error: %s", exc)
-        except RuntimeError:
-            print(f"[notifications] push_notification error: {exc}")
+        _log_error("push_notification error: %s", exc)
         return None
 
 
@@ -255,16 +304,18 @@ def get_notifications():
         limit = 50
 
     try:
-        unread_resp  = supabase.table("notification").select("id", count="exact").eq("is_read", False).execute()
+        unread_resp  = supabase.table("notification").select("id", count="exact") \
+            .eq("is_read", _bool_filter(False)).execute()
         unread_count = unread_resp.count or 0
 
         q = supabase.table("notification").select(
-            "id, record_type, record_id, control_no, title, message, request_snapshot, is_read, created_at, read_at"
+            "id, record_type, record_id, control_no, title, message, "
+            "request_snapshot, is_read, created_at, read_at"
         )
-        if record_type in ("birth", "death", "marriage"):
+        if record_type in VALID_RECORD_TYPES:
             q = q.eq("record_type", record_type)
         if unread_only:
-            q = q.eq("is_read", False)
+            q = q.eq("is_read", _bool_filter(False))
         rows = q.order("created_at", desc=True).limit(limit).execute().data or []
 
         return jsonify({
@@ -274,21 +325,22 @@ def get_notifications():
         })
 
     except Exception as exc:
-        current_app.logger.error("GET /api/notifications error: %s", exc)
+        _log_error("GET /api/notifications error: %s", exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROUTE 1b — GET /api/notifications/unread-count  (lightweight badge poll)
+# ROUTE 1b — GET /api/notifications/unread-count
 # ══════════════════════════════════════════════════════════════════════════════
 
 @notifications_bp.route("/api/notifications/unread-count", methods=["GET"])
 def get_unread_count():
     try:
-        resp = supabase.table("notification").select("id", count="exact").eq("is_read", False).execute()
+        resp = supabase.table("notification").select("id", count="exact") \
+            .eq("is_read", _bool_filter(False)).execute()
         return jsonify({"success": True, "unread_count": resp.count or 0})
     except Exception as exc:
-        current_app.logger.error("GET /api/notifications/unread-count error: %s", exc)
+        _log_error("GET /api/notifications/unread-count error: %s", exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
@@ -310,13 +362,13 @@ def mark_read():
         if ids == "all":
             resp = supabase.table("notification").update(
                 {"is_read": True, "read_at": now}
-            ).eq("is_read", False).execute()
+            ).eq("is_read", _bool_filter(False)).execute()
         elif isinstance(ids, list) and len(ids) > 0:
-            if not all(isinstance(i, int) for i in ids):
+            if not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
                 return jsonify({"success": False, "error": "ids must be a list of ints"}), 400
             resp = supabase.table("notification").update(
                 {"is_read": True, "read_at": now}
-            ).in_("id", ids).eq("is_read", False).execute()
+            ).in_("id", ids).eq("is_read", _bool_filter(False)).execute()
         else:
             return jsonify({
                 "success": False,
@@ -330,7 +382,7 @@ def mark_read():
         return jsonify({"success": True, "updated": updated})
 
     except Exception as exc:
-        current_app.logger.error("POST /api/notifications/read error: %s", exc)
+        _log_error("POST /api/notifications/read error: %s", exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
@@ -344,18 +396,17 @@ def get_summary():
         result = {}
         total  = 0
 
-        for rtype in ("birth", "death", "marriage"):
-            unread_resp = supabase.table("notification").select(
-                "id", count="exact"
-            ).eq("record_type", rtype).eq("is_read", False).execute()
+        for rtype in VALID_RECORD_TYPES:
+            unread_resp = supabase.table("notification").select("id", count="exact") \
+                .eq("record_type", rtype).eq("is_read", _bool_filter(False)).execute()
             unread = unread_resp.count or 0
             total += unread
 
             recent_resp = supabase.table("notification").select(
-                "id, record_type, record_id, control_no, title, message, request_snapshot, is_read, created_at, read_at"
-            ).eq("record_type", rtype).eq("is_read", False).order(
-                "created_at", desc=True
-            ).limit(5).execute()
+                "id, record_type, record_id, control_no, title, message, "
+                "request_snapshot, is_read, created_at, read_at"
+            ).eq("record_type", rtype).eq("is_read", _bool_filter(False)) \
+             .order("created_at", desc=True).limit(5).execute()
 
             result[rtype] = {
                 "unread": unread,
@@ -365,7 +416,7 @@ def get_summary():
         return jsonify({"success": True, "total_unread": total, "by_type": result})
 
     except Exception as exc:
-        current_app.logger.error("GET /api/notifications/summary error: %s", exc)
+        _log_error("GET /api/notifications/summary error: %s", exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
@@ -379,7 +430,8 @@ def get_notification_detail(notif_id: int):
 
     try:
         rows = supabase.table("notification").select(
-            "id, record_type, record_id, control_no, title, message, request_snapshot, is_read, created_at, read_at"
+            "id, record_type, record_id, control_no, title, message, "
+            "request_snapshot, is_read, created_at, read_at"
         ).eq("id", notif_id).limit(1).execute().data or []
 
         if not rows:
@@ -398,12 +450,18 @@ def get_notification_detail(notif_id: int):
         return jsonify({"success": True, "notification": _row_to_payload(notif)})
 
     except Exception as exc:
-        current_app.logger.error("GET /api/notifications/%s error: %s", notif_id, exc)
+        _log_error("GET /api/notifications/%s error: %s", notif_id, exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE 5 — GET /api/notifications/records/<notif_id>
+#
+# CAUTION: this looks up notification.record_id in birth_records /
+# death_records / marriage_records. If notifications created for ONLINE
+# REQUESTS store the id of a civil_registry_request row in record_id, this
+# will return the wrong record (or none). Check what citizen_requests.py
+# passes as record_id.
 # ══════════════════════════════════════════════════════════════════════════════
 
 @notifications_bp.route("/api/notifications/records/<int:notif_id>", methods=["GET"])
@@ -420,9 +478,6 @@ def get_linked_record(notif_id: int):
         record_type = (notif.get("record_type") or "").lower()
         record_id   = notif.get("record_id")
 
-        # FIXED: the old map pointed at "*_requests" tables that never existed
-        # in Supabase. These are the real table names from the birth/death/
-        # marriage conversions.
         table_map = {
             "birth":    "birth_records",
             "death":    "death_records",
@@ -434,8 +489,10 @@ def get_linked_record(notif_id: int):
         if table and record_id:
             recs = supabase.table(table).select("*").eq("id", record_id).limit(1).execute().data or []
             record = recs[0] if recs else None
-            if record and "pdf_data" in record:
-                record.pop("pdf_data", None)  # keep this endpoint light
+            if record:
+                # keep this endpoint light: drop the big PDF blobs
+                record.pop("pdf_data", None)   # birth
+                record.pop("pdf_file", None)   # death
 
         return jsonify({
             "success":     True,
@@ -446,7 +503,7 @@ def get_linked_record(notif_id: int):
         })
 
     except Exception as exc:
-        current_app.logger.error("GET /api/notifications/records/%s error: %s", notif_id, exc)
+        _log_error("GET /api/notifications/records/%s error: %s", notif_id, exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
@@ -467,20 +524,22 @@ def delete_notification(notif_id: int):
         return jsonify({"success": True, "deleted": notif_id})
 
     except Exception as exc:
-        current_app.logger.error("DELETE /api/notifications/%s error: %s", notif_id, exc)
+        _log_error("DELETE /api/notifications/%s error: %s", notif_id, exc)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE 7 — GET /api/notifications/stream  (SSE)
+#
+# Note: subscribers live in this process's memory. That works with ONE
+# worker process (or threads). With several gunicorn workers, or on a
+# serverless host, a notification created in one worker will not reach
+# streams connected to another. Use `gunicorn --workers 1 --threads 8`
+# (or gevent), or move to Supabase Realtime for multi-worker setups.
 # ══════════════════════════════════════════════════════════════════════════════
 
 @notifications_bp.route("/api/notifications/stream")
 def sse_stream():
-    """
-    Server-Sent Events endpoint. Each connected client gets new notifications
-    pushed within milliseconds of push_notification() being called.
-    """
     try:
         _start_keepalive_thread(current_app._get_current_object())
     except Exception:
@@ -506,13 +565,16 @@ def sse_stream():
             with _lock:
                 _subscribers.discard(client_q)
 
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control":               "no-cache",
-            "X-Accel-Buffering":           "no",
-            "Access-Control-Allow-Origin": "*",
-            "Connection":                  "keep-alive",
-        },
-    )
+    allow_origin = os.getenv("SSE_ALLOW_ORIGIN", "*")
+    headers = {
+        "Cache-Control":               "no-cache",
+        "X-Accel-Buffering":           "no",
+        "Access-Control-Allow-Origin": allow_origin,
+        "Connection":                  "keep-alive",
+    }
+    if allow_origin != "*":
+        # browsers only send cookies to a specific origin, never to "*"
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+
+    return Response(generate(), mimetype="text/event-stream", headers=headers)
