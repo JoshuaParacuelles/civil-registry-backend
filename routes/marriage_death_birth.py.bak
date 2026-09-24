@@ -5,7 +5,6 @@ import json
 import uuid
 import base64
 import hashlib
-from functools import wraps
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -102,26 +101,26 @@ def _matches_online_death_request(first_name: Optional[str], last_name: Optional
 def _matches_online_marriage_request(groom_full_name: Optional[str] = None,
                                       bride_full_name: Optional[str] = None,
                                       control_no: Optional[str] = None) -> bool:
-    """Groom AND bride must match the SAME online request row.
-    (Previously either name alone was enough, which caused false notifications.)"""
     try:
         if control_no:
             res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
                 .eq("record_type", "marriage").eq("control_no", control_no).limit(1).execute()
             if res.data:
                 return True
-
-        groom = (groom_full_name or "").strip()
-        bride = (bride_full_name or "").strip()
-        if not groom and not bride:
-            return False
-
-        q = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id").eq("record_type", "marriage")
-        if groom:
-            q = q.ilike("husband_fullname", groom)
-        if bride:
-            q = q.ilike("wife_maiden_name", bride)
-        return bool(q.limit(1).execute().data)
+        if groom_full_name:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "marriage") \
+                .ilike("husband_fullname", groom_full_name.strip()) \
+                .limit(1).execute()
+            if res.data:
+                return True
+        if bride_full_name:
+            res = supabase.table(CIVIL_REGISTRY_REQUEST_TABLE).select("id") \
+                .eq("record_type", "marriage") \
+                .ilike("wife_maiden_name", bride_full_name.strip()) \
+                .limit(1).execute()
+            return bool(res.data)
+        return False
     except Exception:
         return False
 
@@ -691,11 +690,11 @@ def complete_transaction():
             full_name_parts = [p for p in [first_name, middle_name, last_name] if p]
             subject = " ".join(full_name_parts) if full_name_parts else (search_operator or "Unknown")
             push_notification(
-                record_type="death",
+                record_type="DEATH",
                 record_id=record_id,
                 control_no=payment_reference or search_operator or None,
                 message=f"Death certificate issued for '{subject}'",
-                title="Death Certificate Issued",
+                notif_type="death",
             )
 
         return jsonify({"success": True, "message": "Transaction saved successfully."}), 200
@@ -800,18 +799,6 @@ birth_bp = Blueprint('birth', __name__)
 
 def get_user():
     return session.get("username", "System")
-
-
-def admin_required(fn):
-    """Blocks the /admin/* maintenance routes unless someone is logged in.
-    Set ADMIN_ROUTES_REQUIRE_LOGIN=0 to disable while testing.
-    Add a role check here too if your login stores a role in the session."""
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if os.getenv("ADMIN_ROUTES_REQUIRE_LOGIN", "1") == "1" and not session.get("username"):
-            return jsonify({"error": "Authentication required."}), 401
-        return fn(*args, **kwargs)
-    return wrapper
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1577,16 +1564,8 @@ def complete_transaction():
         # CLEANED UP: dropped the stray `connection` positional arg and the
         # `notif_type=` kwarg — push_notification() no longer needs a DB
         # handle, and record_type is passed the normal way. ──
-        match_first, match_last = first_name, last_name
-        if record_id:
-            _rec = supabase.table("birth_records").select("child_first_name, child_last_name") \
-                .eq("id", record_id).limit(1).execute().data
-            if _rec:
-                match_first = _rec[0].get("child_first_name") or first_name
-                match_last  = _rec[0].get("child_last_name") or last_name
-
         if payment_status == 'positive' and _matches_online_birth_request(
-            match_first, match_last, control_no=payment_reference or None
+            first_name, last_name, control_no=payment_reference or None
         ):
             subject = search_operator or f"{first_name} {last_name}".strip() or "Unknown"
             push_notification(
@@ -2518,7 +2497,6 @@ def _repair_row(record_id, real_path):
 # =============================================================================
 
 @marriage_bp.route("/admin/repair-paths", methods=["POST"])
-@admin_required
 def admin_repair_paths():
     try:
         res  = supabase.table("marriage_records").select(
@@ -2550,7 +2528,6 @@ def admin_repair_paths():
 
 
 @marriage_bp.route("/admin/debug-paths", methods=["GET"])
-@admin_required
 def admin_debug_paths():
     files_active  = os.listdir(UPLOAD_DIR)[:50]         if os.path.isdir(UPLOAD_DIR)         else []
     files_archive = os.listdir(ARCHIVE_UPLOAD_DIR)[:50] if os.path.isdir(ARCHIVE_UPLOAD_DIR) else []
@@ -2571,7 +2548,6 @@ def admin_debug_paths():
 # =============================================================================
 
 @marriage_bp.route("/admin/backfill-is-archived", methods=["POST"])
-@admin_required
 def admin_backfill_is_archived():
     try:
         res = supabase.table("marriage_records") \
@@ -2614,7 +2590,6 @@ def admin_backfill_is_archived():
 # =============================================================================
 
 @marriage_bp.route("/admin/is-archived-status", methods=["GET"])
-@admin_required
 def admin_is_archived_status():
     try:
         res = supabase.table("marriage_records").select(
@@ -2650,7 +2625,6 @@ def admin_is_archived_status():
 # =============================================================================
 
 @marriage_bp.route("/admin/set-archived", methods=["POST"])
-@admin_required
 def admin_set_archived():
     try:
         data = request.get_json(force=True) or {}
