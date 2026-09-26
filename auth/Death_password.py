@@ -118,7 +118,7 @@ def change_module_password():
         stored_hash = row["password_hash"]
 
         if not _verify_password(current_password, stored_hash):
-            return jsonify({"success": False, "message": "Current password is incorrect."}), 401
+            return jsonify({"success": False, "message": "Current password is incorrect.", "code": "INVALID_PASSWORD"}), 401
 
         new_hash = _hash_password(new_password)
         supabase.table("module_passwords").update({

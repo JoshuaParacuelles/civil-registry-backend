@@ -101,7 +101,7 @@ def change_module_password():
     row = res.data[0] if res.data else None
 
     if not row or not _verify(current_pw, row["password_hash"]):
-        return jsonify({"success": False, "message": "Current password is incorrect."}), 401
+        return jsonify({"success": False, "message": "Current password is incorrect.", "code": "INVALID_PASSWORD"}), 401
 
     supabase.table("module_passwords").update({
         "password_hash": _hash(new_pw),
@@ -113,9 +113,3 @@ def change_module_password():
     }
     return jsonify({"success": True, "message": f"{labels[module]} password updated successfully."})
 
-# Record CRUD (list_records, upload_record, get_record, download_record,
-# archive_record, restore_record, delete_record, list_archived) intentionally
-# removed here — routes/birth.py already owns birth_records CRUD against
-# Supabase. Tell me if these specific /api/birth/records... endpoints under
-# this blueprint are still called separately by the frontend and I'll add
-# them back, pointed at the same table with matching columns.

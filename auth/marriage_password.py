@@ -143,7 +143,7 @@ def change_marriage_module_password():
             return jsonify({"success": False, "message": "Module password not found."}), 404
 
         if not _verify(current_pw, row["password_hash"]):
-            return jsonify({"success": False, "message": "Current password is incorrect."}), 401
+            return jsonify({"success": False, "message": "Current password is incorrect.", "code": "INVALID_PASSWORD"}), 401
 
         supabase.table("module_passwords").update({
             "password_hash": _hash(new_pw),
