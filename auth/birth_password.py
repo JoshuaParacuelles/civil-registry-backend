@@ -77,7 +77,11 @@ def verify_module_password():
     return jsonify({"success": False, "message": "Incorrect password."}), 401
 
 
-@birth_archive_bp.route("/api/change-module-password", methods=["POST"])
+# FIX: was "/api/change-module-password" — missing "/birth", so it never
+# matched Marriage's and Death's naming convention
+# (/api/marriage/change-module-password, /api/death/change-module-password).
+# If the frontend calls the consistent path for Birth too, it was 404ing.
+@birth_archive_bp.route("/api/birth/change-module-password", methods=["POST"])
 def change_module_password():
     data       = request.get_json(silent=True) or {}
     module     = data.get("module",          "").strip()

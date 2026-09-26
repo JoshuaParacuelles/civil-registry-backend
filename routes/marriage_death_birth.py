@@ -233,19 +233,7 @@ def serialize_fields(fields: List[Dict[str, str]]) -> str:
 # PASSWORD VERIFICATION HELPER (Death)
 # =============================================================================
 
-def verify_module_password(module_key: str, password: str) -> bool:
-    if not module_key or not password:
-        return False
-    try:
-        res = supabase.table("module_passwords").select("password_hash").eq("module_key", module_key).limit(1).execute()
-        if not res.data:
-            return False
-        stored_hash = res.data[0]["password_hash"]
-        if isinstance(stored_hash, str):
-            stored_hash = stored_hash.encode("utf-8")
-        return bcrypt.checkpw(password.encode("utf-8"), stored_hash)
-    except Exception:
-        return False
+
 
 
 # =============================================================================
@@ -775,19 +763,6 @@ def get_stats():
 # AUTH (Death)
 # =============================================================================
 
-@death_bp.route("/auth/verify", methods=["POST"])
-def verify_password():
-    data     = request.get_json(silent=True) or {}
-    module   = normalize_spaces(data.get("module",   ""))
-    password = data.get("password", "")
-
-    if not module or not password:
-        return jsonify({"success": False, "message": "Module and password are required."}), 400
-
-    if verify_module_password(module, password):
-        return jsonify({"success": True}), 200
-
-    return jsonify({"success": False, "message": "Incorrect password."}), 401
 
 
 # #############################################################################

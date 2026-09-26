@@ -137,7 +137,7 @@ app.register_blueprint(role_bp)
 app.register_blueprint(notifications_bp)
 app.register_blueprint(external_bp)
 app.register_blueprint(document_bp)
-app.register_blueprint(citizen_requests_bp)   # ← IDUGANG DINHI
+app.register_blueprint(citizen_requests_bp)  
 
 with app.app_context():
     try:
