@@ -1,7 +1,7 @@
 import os
 import sys
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from supabase_client import supabase
@@ -29,6 +29,39 @@ SESSION_TTL_REMEMBER_ME = 7 * 24 * 3600
 # "Invalid credentials" even with the correct password.
 PASSWORD_COLUMN = "password"
 
+# ─────────────────────────────────────────────
+# ATTEMPT / LOCKOUT CONFIG
+# ─────────────────────────────────────────────
+# Each "cycle" gives the account MAX_LOGIN_ATTEMPTS failed tries before it is
+# locked. The lock duration escalates with each *consecutive* lockout:
+#   tier 1 -> 5 minutes
+#   tier 2 -> 10 minutes
+#   tier 3 -> 24 hours
+# A successful login is the only thing that resets the tier back to 0.
+# Beyond tier 3 the spec doesn't say what happens on a further failure cycle,
+# so this caps at the 24h duration (tier stays at 3) rather than escalating
+# further or wrapping back to 5 minutes. Change MAX_LOCK_TIER's behavior
+# below (the `min(..., MAX_LOCK_TIER)` line) if you'd rather have it wrap
+# back to tier 1 after a 24h lock is served.
+MAX_LOGIN_ATTEMPTS = 3
+LOCK_TIER_SECONDS = {
+    1: 5 * 60,            # 5 minutes
+    2: 10 * 60,           # 10 minutes
+    3: 24 * 60 * 60,      # 24 hours
+}
+MAX_LOCK_TIER = 3
+
+# Column semantics for the two columns that already existed on `users`:
+#   lock_level -> escalation tier (0..MAX_LOCK_TIER). PERSISTS across an
+#                 unlock so the *next* lockout in a row escalates. Only a
+#                 successful login resets it to 0.
+#   lock_time  -> the UTC timestamp the CURRENT lock EXPIRES AT (not when it
+#                 started). NULL whenever there is no active lock. This
+#                 lets "is currently locked" be a single now()-comparison
+#                 instead of needing to also know the tier's duration.
+# `login_attempts` keeps its original meaning: failed tries in the current
+# (post-unlock) cycle. `temp_attempts` is left untouched/unused.
+
 
 def hash_password(password):
     """Hash a password using a salted algorithm (pbkdf2:sha256 by default)."""
@@ -47,6 +80,51 @@ def verify_password(password, stored_hash):
 def now_iso():
     """Return current UTC time in ISO format"""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(value):
+    """Best-effort parse of a Supabase timestamp value (str or datetime) into
+    a tz-aware UTC datetime. Returns None if it can't be parsed."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        raw = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        dt = datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def compute_lock_status(user):
+    """
+    Returns (is_locked, seconds_remaining, lock_level) for a user row,
+    based on the persisted lock_level / lock_time columns. Always computed
+    fresh against the current time so a lock that has simply timed out
+    (but hasn't been written back to the DB yet by a login attempt) is
+    correctly reported as unlocked.
+    """
+    lock_level = user.get('lock_level') or 0
+    locked_until = _parse_ts(user.get('lock_time'))
+
+    if not lock_level or not locked_until:
+        return False, 0, lock_level
+
+    now = datetime.now(timezone.utc)
+    if now < locked_until:
+        return True, int((locked_until - now).total_seconds()), lock_level
+
+    return False, 0, lock_level
+
+
+def _format_duration(seconds):
+    """Human-readable duration for lockout messages."""
+    if seconds >= 3600:
+        hrs = max(1, round(seconds / 3600))
+        return f"{hrs} hour{'s' if hrs != 1 else ''}"
+    mins = max(1, round(seconds / 60))
+    return f"{mins} minute{'s' if mins != 1 else ''}"
 
 
 # ─────────────────────────────────────────────
@@ -206,6 +284,8 @@ def login():
             }), 500
 
         if not users:
+            # No account to rate-limit/lock here — nothing is persisted for
+            # a username that doesn't exist, so there's nothing to escalate.
             safe_record_action(None, "LOGIN_FAILED", {"username": username, "reason": "User not found"})
             return jsonify({
                 "success": False,
@@ -221,32 +301,84 @@ def login():
                 "message": "Database configuration error"
             }), 500
 
+        # ── LOCKOUT CHECK (before password verification) ──────────────
+        # Checked first and computed fresh against the current time, so a
+        # lock that has simply timed out is treated as unlocked even if no
+        # prior request has written that back to the row yet. A locked
+        # account never has its password checked, so failed attempts can't
+        # be probed/counted while it's locked, and clearing browser
+        # storage / switching devices / calling the API directly can't
+        # bypass this — it's evaluated purely from the DB row.
+        is_locked, seconds_remaining, _ = compute_lock_status(user)
+        if is_locked:
+            safe_record_action(user.get('id'), "LOGIN_FAILED", {
+                "username": username,
+                "reason": "Account locked",
+            })
+            return jsonify({
+                "success": False,
+                "message": f"Account is locked. Please try again in {_format_duration(seconds_remaining)}.",
+                "lock_seconds_remaining": seconds_remaining,
+            }), 403
+
         stored_hash = user.get(PASSWORD_COLUMN)
         print(f"[LOGIN] Using password column: '{PASSWORD_COLUMN}'")
 
         # Verify password using salted hash comparison
         if not stored_hash or not verify_password(password, stored_hash):
             print(f"[LOGIN] Password mismatch for user '{username}'")
+
+            attempts = (user.get('login_attempts') or 0) + 1
+            update_fields = {'login_attempts': attempts}
+
+            if attempts >= MAX_LOGIN_ATTEMPTS:
+                # 3rd (or more) failed attempt in this cycle -> lock the
+                # account, escalating the tier from whatever it was left at
+                # by the previous lockout.
+                new_tier = min((user.get('lock_level') or 0) + 1, MAX_LOCK_TIER)
+                duration = LOCK_TIER_SECONDS[new_tier]
+                locked_until = datetime.now(timezone.utc) + timedelta(seconds=duration)
+                update_fields.update({
+                    'lock_level': new_tier,
+                    'lock_time': locked_until.isoformat(),
+                    'login_attempts': 0,  # fresh 3 attempts once this lock is served
+                })
+            else:
+                # Not locking yet on this attempt. Make sure any stale
+                # (already-expired) lock_time from a previous cycle is
+                # cleared so lock status stays accurate.
+                update_fields['lock_time'] = None
+
+            try:
+                supabase.table('users').update(update_fields).eq('id', user['id']).execute()
+            except Exception as e:
+                print(f"[LOGIN LOCKOUT UPDATE ERROR] {e}")
+
+            if attempts >= MAX_LOGIN_ATTEMPTS:
+                safe_record_action(user.get('id'), "LOGIN_FAILED", {
+                    "username": username,
+                    "reason": f"Account locked (tier {update_fields['lock_level']})",
+                })
+                return jsonify({
+                    "success": False,
+                    "message": (
+                        f"Account locked after {MAX_LOGIN_ATTEMPTS} failed attempts. "
+                        f"Please try again in {_format_duration(duration)}."
+                    ),
+                }), 403
+
+            remaining = MAX_LOGIN_ATTEMPTS - attempts
             safe_record_action(user.get('id'), "LOGIN_FAILED", {
                 "username": username,
                 "reason": "Invalid password",
             })
             return jsonify({
                 "success": False,
-                "message": "Invalid username or password"
+                "message": (
+                    f"Invalid username or password. {remaining} attempt"
+                    f"{'s' if remaining != 1 else ''} remaining before temporary lockout."
+                ),
             }), 401
-
-        # Check if user is locked. The schema stores this as an integer
-        # 'lock_level' (0 = unlocked), not a boolean 'is_locked' column.
-        if user.get('lock_level', 0) > 0:
-            safe_record_action(user['id'], "LOGIN_FAILED", {
-                "username": username,
-                "reason": "Account locked",
-            })
-            return jsonify({
-                "success": False,
-                "message": "Account is locked. Please contact an administrator."
-            }), 403
 
         # Get roles/permissions BEFORE building the session, since is_admin
         # is derived from permissions (there's no is_admin column on users).
@@ -280,12 +412,16 @@ def login():
 
         print(f"[LOGIN] Session set for user: {username}")
 
-        # Update last login time
+        # Update last login time. A successful login is the only thing that
+        # fully resets the attempt/lockout state, including the escalation
+        # tier — start clean next time the account has a failure.
         try:
             update_data = {
                 'last_login': now_iso(),
                 'is_online': True,
-                'login_attempts': 0
+                'login_attempts': 0,
+                'lock_level': 0,
+                'lock_time': None,
             }
             supabase.table('users')\
                 .update(update_data)\
@@ -304,7 +440,7 @@ def login():
             "id": user['id'],
             "username": user['username'],
             "is_admin": is_admin_flag,
-            "is_locked": user.get('lock_level', 0) > 0,
+            "is_locked": False,
             "roles": role_names,
             "permissions": list(permissions)
         }
@@ -434,6 +570,11 @@ def get_session():
             # Ensure baseline access
             permissions.add('dashboard')
 
+            # Computed fresh (not read straight off lock_level) so this
+            # reflects an auto-expired lock immediately, rather than
+            # whatever lock_level was last written to the row.
+            is_locked, _, _ = compute_lock_status(user)
+
             return jsonify({
                 "authenticated": True,
                 "is_admin": is_admin_flag,
@@ -443,7 +584,7 @@ def get_session():
                     "id": user['id'],
                     "username": user['username'],
                     "is_admin": is_admin_flag,
-                    "is_locked": user.get('lock_level', 0) > 0,
+                    "is_locked": is_locked,
                     "roles": role_names,
                     "permissions": list(permissions)
                 }
