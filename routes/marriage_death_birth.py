@@ -3,6 +3,7 @@ import re
 import os
 import json
 import uuid
+import time
 import base64
 import hashlib
 from datetime import datetime, timezone, timedelta
@@ -1805,6 +1806,10 @@ MARRIAGE_MAX_FILE_SIZE_BYTES = MARRIAGE_MAX_FILE_SIZE_MB * 1024 * 1024
 # marriage_records has no blob column, so select everything.
 MARRIAGE_RECORD_SELECT_COLS = "*"
 
+# Files younger than this are never treated as orphans by the cleanup tool
+# (they may belong to an upload that is still being processed).
+ORPHAN_MIN_AGE_SECONDS = 10 * 60
+
 
 def marriage_allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in MARRIAGE_ALLOWED_EXTENSIONS
@@ -1820,6 +1825,50 @@ def _inside_upload_dirs(p):
         rp.startswith(os.path.realpath(d) + os.sep)
         for d in (UPLOAD_DIR, ARCHIVE_UPLOAD_DIR)
     )
+
+
+# =============================================================================
+# SAFE FILE REMOVAL (Marriage)
+#
+# FIX: deleting a record used to swallow every os.remove() error. On Windows,
+# a PDF that was just previewed can still be locked for a moment, so the
+# remove failed silently, the database row was deleted, and the PDF stayed on
+# disk forever as an orphan. Re-uploading the same file then piled up another
+# copy. _safe_remove() retries and reports whether the file is really gone.
+# =============================================================================
+
+def _safe_remove(path, retries=5, delay=0.2):
+    """Delete `path` (only inside the upload folders). Returns True if the
+    file no longer exists afterwards."""
+    if not path or not _inside_upload_dirs(path):
+        return False
+    for attempt in range(retries):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as e:
+            if attempt == retries - 1:
+                print(f"[MARRIAGE] Could not delete '{path}': {e}")
+                return False
+            time.sleep(delay)
+    return not os.path.exists(path)
+
+
+def _all_marriage_rows(columns):
+    """Fetch every row, paging past PostgREST's 1000-row default cap."""
+    rows, start, page = [], 0, 1000
+    while True:
+        res = supabase.table("marriage_records").select(columns) \
+            .order("id", desc=False).range(start, start + page - 1).execute()
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            break
+        start += page
+    return rows
 
 
 # =============================================================================
@@ -2178,9 +2227,17 @@ def resolve_file_path(row):
     secondary = UPLOAD_DIR          if is_archived else ARCHIVE_UPLOAD_DIR
     return _resolve_in_dir(row, primary) or _resolve_in_dir(row, secondary)
 
-def _repair_row(record_id, real_path):
+def _repair_row(record_id, real_path, row=None):
+    """Point the DB row at the file's real location. FIX: only writes when
+    something actually changed (it used to update the row on every view)."""
     try:
         real_name = os.path.basename(real_path)
+        if row is not None:
+            same_name = (row.get("stored_file_name") or "") == real_name
+            same_path = os.path.normcase(os.path.abspath(row.get("file_path") or "")) == \
+                        os.path.normcase(os.path.abspath(real_path))
+            if same_name and same_path:
+                return
         supabase.table("marriage_records").update({
             "stored_file_name": real_name,
             "file_path": real_path,
@@ -2188,6 +2245,21 @@ def _repair_row(record_id, real_path):
         }).eq("id", record_id).execute()
     except Exception:
         pass
+
+
+def _paths_for_row(row):
+    """Every on-disk copy that belongs to this row (either folder)."""
+    paths = set()
+    resolved = resolve_file_path(row)
+    if resolved:
+        paths.add(resolved)
+    stored = os.path.basename((row.get("stored_file_name") or "").strip())
+    if stored:
+        for d in (UPLOAD_DIR, ARCHIVE_UPLOAD_DIR):
+            p = os.path.join(d, stored)
+            if os.path.isfile(p):
+                paths.add(p)
+    return paths
 
 
 # =============================================================================
@@ -2237,6 +2309,120 @@ def admin_debug_paths():
         "active_files":       files_active,
         "archive_files":      files_archive,
     }), 200
+
+
+# -----------------------------------------------------------------------------
+# NEW: orphaned-PDF finder / cleaner.
+#
+# An "orphan" is a PDF in uploads/marriage or uploads/marriage_archive that no
+# database row points to any more (left behind by deletes that couldn't remove
+# the file). This is what produced dozens of copies of the same PDF.
+#
+#   GET  /api/marriage/admin/orphan-files
+#        -> dry run: lists orphans, deletes nothing.
+#   POST /api/marriage/admin/cleanup-orphans   body: {"confirm": true}
+#        -> deletes them. Without confirm it behaves like the dry run.
+#
+# Safety: refuses to run if the database returns no rows at all (so an
+# outage can never make every file look like an orphan), only touches .pdf
+# files inside the two upload folders, and skips files younger than 10 minutes.
+# -----------------------------------------------------------------------------
+
+def _find_orphan_files():
+    rows = _all_marriage_rows(
+        "id, stored_file_name, file_path, is_archived"
+    )
+    if not rows:
+        raise RuntimeError("No marriage records were returned; refusing to scan for orphans.")
+
+    referenced = set()
+    for row in rows:
+        stored = os.path.basename((row.get("stored_file_name") or "").strip())
+        if stored:
+            referenced.add(stored.lower())
+        rp = resolve_file_path(row)
+        if rp:
+            referenced.add(os.path.basename(rp).lower())
+
+    now_ts = time.time()
+    orphans = []
+    for d in (UPLOAD_DIR, ARCHIVE_UPLOAD_DIR):
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            full = os.path.join(d, name)
+            if not (os.path.isfile(full) and name.lower().endswith(".pdf")):
+                continue
+            if name.lower() in referenced:
+                continue
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            if now_ts - st.st_mtime < ORPHAN_MIN_AGE_SECONDS:
+                continue
+            orphans.append({
+                "folder": os.path.basename(d),
+                "file":   name,
+                "size_kb": round(st.st_size / 1024, 1),
+                "path":   full,
+            })
+    return orphans, len(rows), len(referenced)
+
+
+@marriage_bp.route("/admin/orphan-files", methods=["GET"])
+@admin_required
+def admin_orphan_files():
+    try:
+        orphans, record_count, referenced_count = _find_orphan_files()
+        return jsonify({
+            "records_in_database": record_count,
+            "files_referenced":    referenced_count,
+            "orphan_count":        len(orphans),
+            "orphans":             [{k: v for k, v in o.items() if k != "path"} for o in orphans],
+            "note": "Dry run — nothing was deleted. POST to /admin/cleanup-orphans with {\"confirm\": true} to delete.",
+        }), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to scan for orphan files: {e}"}), 500
+
+
+@marriage_bp.route("/admin/cleanup-orphans", methods=["POST"])
+@admin_required
+def admin_cleanup_orphans():
+    try:
+        data = request.get_json(silent=True) or {}
+        orphans, record_count, _ = _find_orphan_files()
+
+        if data.get("confirm") is not True:
+            return jsonify({
+                "deleted": 0,
+                "orphan_count": len(orphans),
+                "note": "Nothing deleted. Send {\"confirm\": true} to delete these files.",
+            }), 200
+
+        deleted, failed = [], []
+        for o in orphans:
+            if _safe_remove(o["path"]):
+                deleted.append(f'{o["folder"]}/{o["file"]}')
+            else:
+                failed.append(f'{o["folder"]}/{o["file"]}')
+
+        record_action(
+            "CLEANUP",
+            f"Removed {len(deleted)} orphaned marriage PDF file(s)",
+            username=get_user(),
+            meta={"deleted": len(deleted), "failed": len(failed)},
+            ip=request.remote_addr
+        )
+
+        return jsonify({
+            "success": True,
+            "deleted": len(deleted),
+            "failed":  len(failed),
+            "failed_files": failed,
+        }), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to clean up orphan files: {e}"}), 500
 
 
 # One-off backfill for rows whose is_archived was left NULL.
@@ -2437,6 +2623,11 @@ def delete_archived(record_id):
 
 # =============================================================================
 # SHARED PDF-SERVE HELPER (Marriage)
+#
+# FIX: the file is now read into memory and served from a BytesIO instead of
+# send_file(path). Serving straight from the path keeps the file open while
+# the response streams, which on Windows blocks os.remove() and left the PDF
+# behind when the record was deleted right after being viewed.
 # =============================================================================
 
 def _serve_pdf(record_id, as_attachment=False):
@@ -2451,16 +2642,19 @@ def _serve_pdf(record_id, as_attachment=False):
         stored       = os.path.basename((row.get("stored_file_name") or "").strip())
         exact_path   = os.path.join(primary_dir, stored) if stored else None
         resolved     = (exact_path if (exact_path and os.path.isfile(exact_path)) else resolve_file_path(row))
-        if resolved:
-            _repair_row(record_id, resolved)
-        else:
+        if not resolved:
             return jsonify({"error": "PDF file not found on server."}), 404
+        _repair_row(record_id, resolved, row)
+
+        with open(resolved, "rb") as f:
+            pdf_bytes = f.read()
 
         return send_file(
-            resolved,
+            io.BytesIO(pdf_bytes),
             mimetype="application/pdf",
             as_attachment=as_attachment,
-            download_name=row.get("original_file_name") or f"{row.get('file_name', 'document')}.pdf"
+            download_name=row.get("original_file_name") or f"{row.get('file_name', 'document')}.pdf",
+            max_age=0,
         )
     except Exception as e:
         return jsonify({"error": f"Failed to serve PDF: {e}"}), 500
@@ -2468,6 +2662,10 @@ def _serve_pdf(record_id, as_attachment=False):
 
 # =============================================================================
 # SHARED DELETE HELPER (Marriage)
+#
+# FIX: removes EVERY on-disk copy that belongs to the record (both folders),
+# retries if the file is briefly locked, and tells the caller when a file
+# could not be removed instead of failing silently.
 # =============================================================================
 
 def _delete_record(record_id):
@@ -2477,14 +2675,25 @@ def _delete_record(record_id):
             return jsonify({"error": "Record not found."}), 404
         row = res.data[0]
 
-        resolved = resolve_file_path(row)
+        paths = _paths_for_row(row)
         supabase.table("marriage_records").delete().eq("id", record_id).execute()
 
-        if resolved and os.path.exists(resolved):
-            try: os.remove(resolved)
-            except Exception: pass
+        leftover = [os.path.basename(p) for p in paths if not _safe_remove(p)]
 
-        return jsonify({"success": True, "message": "Record deleted successfully."}), 200
+        record_action(
+            "DELETE",
+            f"Permanently deleted marriage record: '{row.get('file_name', record_id)}'",
+            username=get_user(),
+            meta={"record_id": record_id, "file_name": row.get("file_name"),
+                  "files_left_on_disk": leftover},
+            ip=request.remote_addr
+        )
+
+        payload = {"success": True, "message": "Record deleted successfully."}
+        if leftover:
+            payload["warning"] = "Record deleted, but some file(s) could not be removed from disk. " \
+                                 "Run /api/marriage/admin/cleanup-orphans to remove them."
+        return jsonify(payload), 200
     except Exception as e:
         return jsonify({"error": f"Failed to delete record: {e}"}), 500
 
@@ -2573,9 +2782,10 @@ def _upload_pdf(target="archive"):
         return jsonify({"error": f"Failed to process PDF: {e}"}), 500
 
     finally:
+        # If anything failed after the file was written, remove it so a
+        # rejected upload never leaves a stray copy behind.
         if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except Exception: pass
+            _safe_remove(tmp_path)
 
 
 # =============================================================================
@@ -2597,7 +2807,7 @@ def get_record_with_pdf(record_id):
         pdf_error = None
 
         if resolved and os.path.isfile(resolved):
-            _repair_row(record_id, resolved)
+            _repair_row(record_id, resolved, row)
             pdf_data = file_to_base64_pdf(resolved)
             if pdf_data is None:
                 pdf_error = "Could not read the PDF file on the server."
