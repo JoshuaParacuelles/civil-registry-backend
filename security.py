@@ -1,10 +1,26 @@
 # security.py  (place in backend/, next to app.py)
 """Shared security helpers so every sensitive route is protected the same way."""
+import re
 from functools import wraps
 
 from flask import jsonify, request, session
 
 from auth.Rolemanagement import is_admin
+
+
+# Vercel origins nga gitugotan (production + preview deployments):
+#   https://civil-registry-scc.vercel.app                                  (stable domain)
+#   https://civil-registry-<hash>-joshua-paracuelles-projects.vercel.app   (preview / deployment URLs)
+# Ang "-joshua-paracuelles-projects" mao ang team suffix nimo, mao nga ang
+# ubang tawo dili maka-himo og URL nga mo-match ani.
+VERCEL_ORIGIN_PATTERNS = [
+    re.compile(r"^https://civil-registry-scc\.vercel\.app$"),
+    re.compile(r"^https://civil-registry(-[a-z0-9]+)*-joshua-paracuelles-projects\.vercel\.app$"),
+]
+
+
+def _is_vercel_origin(origin: str) -> bool:
+    return any(p.match(origin) for p in VERCEL_ORIGIN_PATTERNS)
 
 
 def login_required_hook():
@@ -18,8 +34,7 @@ def login_required_hook():
 
 
 def admin_required(fn):
-    """Decorator: caller must be logged in AND actually be an admin.
-    (The old version only checked that *someone* was logged in.)"""
+    """Decorator: caller must be logged in AND actually be an admin."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         username = session.get("username")
@@ -38,6 +53,10 @@ def register_origin_check(app, allowed_origins):
     Vercel -> Render), so a logged-in user's browser will attach the cookie
     to requests fired from ANY website. Reject state-changing requests that
     come from a browser origin we don't recognise.
+
+    Origins are accepted if they are in `allowed_origins` (localhost +
+    CORS_EXTRA_ORIGINS) OR match one of the Vercel patterns above, so new
+    Vercel preview URLs work without editing the Render env variable.
     """
     allowed = set(allowed_origins)
 
@@ -45,7 +64,14 @@ def register_origin_check(app, allowed_origins):
     def _origin_check():
         if request.method in ("GET", "HEAD", "OPTIONS"):
             return None
+
         origin = request.headers.get("Origin")
-        if origin and origin not in allowed and session.get("username"):
+        if not origin:
+            return None
+
+        if origin in allowed or _is_vercel_origin(origin):
+            return None
+
+        if session.get("username"):
             return jsonify({"error": "Origin not allowed"}), 403
         return None
