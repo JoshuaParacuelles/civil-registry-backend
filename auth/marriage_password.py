@@ -1,6 +1,7 @@
 import bcrypt
 from flask import Blueprint, jsonify, request
 
+from logs.Audits import audit_action, set_audit_context
 from supabase_client import supabase
 
 marriage_auth_bp = Blueprint("marriage_auth_bp", __name__)
@@ -84,11 +85,13 @@ def init_marriage_archive_db():
 # ─────────────────────────────────────────────
 
 @marriage_auth_bp.route("/api/marriage/auth/verify", methods=["POST"])
+@audit_action("MODULE_PASSWORD_VERIFICATION", resource_type="module_password")
 def verify_module_password():
     try:
         data = request.get_json(silent=True) or {}
         module = str(data.get("module", "")).strip()
         password = str(data.get("password", "")).strip()
+        set_audit_context(resource_id=module or "marriage_module", meta={"module": module})
 
         if module not in SEED_MODULES:
             return jsonify({"success": False, "message": "Unknown module."}), 400
@@ -116,12 +119,14 @@ def verify_module_password():
 
 
 @marriage_auth_bp.route("/api/marriage/change-module-password", methods=["POST"])
+@audit_action("MODULE_PASSWORD_CHANGED", resource_type="module_password")
 def change_marriage_module_password():
     try:
         data = request.get_json(silent=True) or {}
         module = str(data.get("module", "")).strip()
         current_pw = str(data.get("currentPassword", "")).strip()
         new_pw = str(data.get("newPassword", "")).strip()
+        set_audit_context(resource_id=module or "marriage_module", meta={"module": module})
 
         if module not in SEED_MODULES:
             return jsonify({"success": False, "message": "Unknown module."}), 400

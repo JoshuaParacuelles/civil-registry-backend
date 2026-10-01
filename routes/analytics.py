@@ -6,6 +6,7 @@ from supabase_client import supabase
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from auth.Rolemanagement import is_admin
+from security import audit_denial
 
 analytics_bp = Blueprint("analytics", __name__)
 
@@ -112,6 +113,7 @@ def _require_login():
     if not REQUIRE_LOGIN:
         return None
     if not session.get("username"):
+        audit_denial("Analytics route requires authentication")
         return jsonify({"error": "Not logged in"}), 401
     return None
 
@@ -838,8 +840,10 @@ def debug_counts():
     """
     username = session.get("username")
     if not username:
+        audit_denial("Debug analytics requires authentication")
         return jsonify({"error": "Not logged in"}), 401
     if not is_admin(username):
+        audit_denial("Debug analytics requires administrator access")
         return jsonify({"error": "Forbidden"}), 403
 
     try:

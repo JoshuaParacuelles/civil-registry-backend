@@ -20,7 +20,7 @@ except Exception as e:
     print("=" * 60)
     raise
 
-from security import register_origin_check
+from security import audit_denial, register_origin_check
 from auth.login import login_bp
 from auth.changepass import changepass_bp
 from routes.marriage_death_birth import birth_bp, death_bp, marriage_bp
@@ -33,12 +33,7 @@ from auth.birth_password import birth_archive_bp, init_birth_archive_db
 from auth.Death_password import death_archive_bp, init_death_archive_db
 from auth.marriage_password import marriage_auth_bp, init_marriage_archive_db
 from logs.Audits import audit_bp, init_audit_db
-from auth.Rolemanagement import (
-    role_bp,
-    init_roles_db,
-    is_admin,
-    get_user_permissions,
-)
+from auth.Rolemanagement import role_bp, init_roles_db
 
 app = Flask(__name__)
 
@@ -94,6 +89,7 @@ def enforce_session_expiry():
     now = datetime.now(timezone.utc).timestamp()
     ttl = session.get('ttl', 24 * 3600)
     if now - session.get('last_seen', now) > ttl:
+        audit_denial("Session expired due to inactivity", action="SESSION_EXPIRED")
         session.clear()
         return
     session['last_seen'] = now
@@ -173,40 +169,6 @@ def health_check():
     return {"status": "healthy"}, 200
 
 
-@app.route('/api/session', methods=['GET'])
-def api_session():
-    """Lightweight session probe used by PermissionContext on load/focus.
-    Intentionally returns 200 even when logged out (authenticated: false)
-    instead of 401, since 'not logged in yet' is a normal, expected state
-    for this endpoint rather than an error condition."""
-    username = session.get('username')
-    if not username:
-        return jsonify({"authenticated": False}), 200
-
-    return jsonify({
-        "authenticated": True,
-        "username": username,
-        "is_admin": is_admin(username),
-        "permissions": get_user_permissions(username),
-    }), 200
-
-
-@app.route('/api/current-user', methods=['GET'])
-def api_current_user():
-    """Used by ChangePassword.jsx to know which account it's changing the
-    password for. This one legitimately should 401 if there's no session,
-    since ChangePassword requires being logged in to do anything useful."""
-    username = session.get('username')
-    if not username:
-        return jsonify({"error": "Not logged in"}), 401
-
-    return jsonify({
-        "username": username,
-        "is_admin": is_admin(username),
-        "permissions": get_user_permissions(username),
-    }), 200
-
-
 # NOTE: the temporary /api/test-session diagnostic endpoint has been removed.
 # It was reachable without logging in and exposed server internals.
 
@@ -215,6 +177,11 @@ def api_current_user():
 def log_unauthorized(resp):
     """Print one line to the Render logs for every 401, so the cause is visible
     there too (cookie missing vs. cookie present but no username in it)."""
+    if resp.status_code in (401, 403):
+        audit_denial(
+            "Request denied by authentication or authorization check",
+            action="ACCESS_DENIED",
+        )
     if resp.status_code == 401:
         cookie_name = app.config.get('SESSION_COOKIE_NAME', 'session')
         print(

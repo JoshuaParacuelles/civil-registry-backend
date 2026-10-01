@@ -128,22 +128,11 @@ def _format_duration(seconds):
 # ─────────────────────────────────────────────
 # AUDIT LOG ADAPTER
 # ─────────────────────────────────────────────
-# This file calls safe_record_action(user_id, action, details), but
-# logs.Audits.record_action has the signature
-# record_action(action, description, username=None, meta=None, ip=None).
-# Passing the arguments straight through stored the user id as the action
-# and the details dict as the username, which is why login rows looked
-# garbled. This adapter translates between the two, and maps LOGIN_SUCCESS
-# onto "LOGIN", the key the Audit Logs page actually has a badge for.
-AUDIT_ACTION_MAP = {
-    "LOGIN_SUCCESS": "LOGIN",
-}
-
 AUDIT_DESCRIPTIONS = {
     "LOGIN_SUCCESS": "Signed in",
     "LOGIN_FAILED":  "Failed sign-in attempt",
+    "ACCOUNT_LOCKED": "Account locked",
     "LOGOUT":        "Signed out",
-    "LOGOUT_BEACON": "Left the page or closed the tab",
 }
 
 
@@ -156,7 +145,7 @@ def client_ip():
     return request.remote_addr
 
 
-def safe_record_action(user_id, action, details=None):
+def safe_record_action(user_id, action, details=None, status=None):
     """Safely record an audit action - handles errors gracefully"""
     try:
         from logs.Audits import record_action
@@ -167,15 +156,27 @@ def safe_record_action(user_id, action, details=None):
             description = f"{description}: {details['reason']}"
 
         username = details.get("username") or session.get("username")
+        role_names = details.get("roles") or []
+        role = details.get("role") or (", ".join(role_names) if role_names else None)
         if user_id is not None:
             details.setdefault("user_id", user_id)
+        if status is None:
+            status = {
+                "LOGIN_SUCCESS": "SUCCESS",
+                "LOGIN_FAILED": "FAILED",
+                "ACCOUNT_LOCKED": "DENIED",
+                "LOGOUT": "SUCCESS",
+            }.get(action, "FAILED")
 
         return record_action(
-            AUDIT_ACTION_MAP.get(action, action),
+            action,
             description,
             username=username,
             meta=details,
             ip=client_ip(),
+            user_id=user_id,
+            role=role,
+            status=status,
         )
     except Exception as e:
         print(f"[AUDIT ERROR] {e}")
@@ -240,11 +241,13 @@ def resolve_is_admin(username, permissions):
 
 @login_bp.route('/api/login', methods=['POST'])
 def login():
+    username = None
     try:
         data = request.get_json()
         print(f"[LOGIN] Request received")
 
         if not data:
+            safe_record_action(None, "LOGIN_FAILED", {"reason": "Malformed JSON body"})
             return jsonify({
                 "success": False,
                 "message": "Missing JSON body"
@@ -260,6 +263,10 @@ def login():
         print(f"[LOGIN] Username: '{username}'")
 
         if not username or not password:
+            safe_record_action(None, "LOGIN_FAILED", {
+                "username": username,
+                "reason": "Malformed credentials",
+            })
             return jsonify({
                 "success": False,
                 "message": "Username and password required"
@@ -276,6 +283,10 @@ def login():
             print(f"[LOGIN] Found {len(users)} user(s)")
         except Exception as e:
             print(f"[DB ERROR] {e}")
+            safe_record_action(None, "LOGIN_FAILED", {
+                "username": username,
+                "reason": "User lookup failed",
+            })
             return jsonify({
                 "success": False,
                 "message": "Database error"
@@ -294,6 +305,10 @@ def login():
 
         if PASSWORD_COLUMN not in user:
             print(f"[LOGIN ERROR] Expected '{PASSWORD_COLUMN}' column not found on users row: {list(user.keys())}")
+            safe_record_action(user.get("id"), "LOGIN_FAILED", {
+                "username": username,
+                "reason": "Password configuration error",
+            })
             return jsonify({
                 "success": False,
                 "message": "Database configuration error"
@@ -309,7 +324,7 @@ def login():
         # bypass this — it's evaluated purely from the DB row.
         is_locked, seconds_remaining, _ = compute_lock_status(user)
         if is_locked:
-            safe_record_action(user.get('id'), "LOGIN_FAILED", {
+            safe_record_action(user.get('id'), "ACCOUNT_LOCKED", {
                 "username": username,
                 "reason": "Account locked",
             })
@@ -355,7 +370,12 @@ def login():
             if attempts >= MAX_LOGIN_ATTEMPTS:
                 safe_record_action(user.get('id'), "LOGIN_FAILED", {
                     "username": username,
-                    "reason": f"Account locked (tier {update_fields['lock_level']})",
+                    "reason": "Invalid password",
+                })
+                safe_record_action(user.get('id'), "ACCOUNT_LOCKED", {
+                    "username": username,
+                    "reason": "Maximum failed attempts reached",
+                    "lock_level": update_fields["lock_level"],
                 })
                 return jsonify({
                     "success": False,
@@ -396,6 +416,9 @@ def login():
         session['user_id'] = user['id']
         session['username'] = user['username']
         session['is_admin'] = is_admin_flag
+        session['role'] = ", ".join(role_names) if role_names else (
+            "Administrator" if is_admin_flag else "User"
+        )
         # NOTE: with signed-cookie sessions everything below lives inside the
         # browser cookie, which browsers silently drop above ~4 KB. If no other
         # route reads session['user_data'], delete this line to keep the cookie small.
@@ -431,7 +454,8 @@ def login():
 
         safe_record_action(user['id'], "LOGIN_SUCCESS", {
             "username": username,
-            "remember_me": remember_me
+            "remember_me": remember_me,
+            "roles": role_names,
         })
 
         response_user = {
@@ -453,6 +477,10 @@ def login():
 
     except Exception as e:
         print(f"[LOGIN ERROR] {e}")
+        safe_record_action(None, "LOGIN_FAILED", {
+            "username": username,
+            "reason": "Unexpected login failure",
+        })
         import traceback
         traceback.print_exc()
         return jsonify({
@@ -498,34 +526,16 @@ def logout():
 
 @login_bp.route('/api/logout-beacon', methods=['POST'])
 def logout_beacon():
-    """Endpoint for navigator.sendBeacon() - doesn't need JSON response"""
-    try:
-        user_id = session.get('user_id')
-
-        if user_id:
-            try:
-                supabase.table('users')\
-                    .update({
-                        'is_online': False,
-                        'last_logout': now_iso()
-                    })\
-                    .eq('id', user_id)\
-                    .execute()
-            except Exception:
-                pass
-
-            safe_record_action(user_id, "LOGOUT_BEACON", {"username": session.get('username')})
-
-        # Deliberately NOT calling session.clear() here. sendBeacon fires on
-        # page unload/hide (reload, tab switch, navigation) and can't tell those
-        # apart from the tab really closing, so clearing the session here
-        # silently logged people out. The frontend keeps its auth flag in
-        # sessionStorage, which disappears when the tab closes, and an explicit
-        # Logout still goes through /api/logout, which does clear the session.
-
-    except Exception:
-        pass
-
+    """Update presence on page hide without treating it as an explicit logout."""
+    user_id = session.get('user_id')
+    if user_id:
+        try:
+            supabase.table('users').update({
+                'is_online': False,
+                'last_logout': now_iso(),
+            }).eq('id', user_id).execute()
+        except Exception as e:
+            print(f"[LOGOUT BEACON UPDATE ERROR] {e}")
     return '', 204
 
 
@@ -606,3 +616,21 @@ def get_session():
             "permissions": [],
             "is_admin": False
         }), 200
+
+
+@login_bp.route('/api/current-user', methods=['GET'])
+def current_user():
+    username = session.get("username")
+    if not username:
+        return jsonify({"error": "Not logged in"}), 401
+
+    role_names, permissions = get_roles_and_permissions(username)
+    is_admin_flag = resolve_is_admin(username, permissions)
+    if is_admin_flag:
+        permissions.add("*")
+    permissions.add("dashboard")
+    return jsonify({
+        "username": username,
+        "is_admin": is_admin_flag,
+        "permissions": list(permissions),
+    }), 200

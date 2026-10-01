@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, Response, current_app, jsonify, request, session
 
 from supabase_client import supabase
+from security import audit_denial
 
 notifications_bp = Blueprint("notifications", __name__)
 
@@ -178,6 +179,7 @@ def _require_login():
         return None
     if session.get("username"):
         return None
+    audit_denial("Notification route requires authentication")
     return jsonify({"success": False, "error": "Authentication required"}), 401
 
 

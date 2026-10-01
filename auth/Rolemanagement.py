@@ -7,6 +7,8 @@ from functools import wraps
 
 import httpx
 from flask import Blueprint, request, jsonify, session
+from logs.Audits import audit_action, record_action, set_audit_context
+from security import audit_denial, require_admin
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -585,27 +587,17 @@ def require_permission(module: str):
         def wrapper(*args, **kwargs):
             username = session.get("username")
             if not username:
+                audit_denial("Permission check requires authentication")
                 return jsonify({"error": "Not logged in"}), 401
             perms = get_user_permissions(username)
             if module not in perms:
+                audit_denial(f"Required permission missing: {module}")
                 return jsonify({
                     "error": f"Access denied — your role does not include '{module}'"
                 }), 403
             return fn(*args, **kwargs)
         return wrapper
     return decorator
-
-
-def require_admin(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        username = session.get("username")
-        if not username:
-            return jsonify({"error": "Not logged in"}), 401
-        if not is_admin(username):
-            return jsonify({"error": "Access denied — admin privileges required"}), 403
-        return fn(*args, **kwargs)
-    return wrapper
 
 
 # --- INIT --------------------------------------------------------------------
@@ -744,6 +736,7 @@ def init_roles_db():
 
 @role_bp.route("/api/roles", methods=["GET"])
 @require_admin
+@audit_action("ROLES_VIEWED", resource_type="role")
 def get_roles():
     resp = _exec(supabase.table("roles").select("*").order("id"))
     rows = resp.data or []
@@ -763,6 +756,7 @@ def get_roles():
 
 @role_bp.route("/api/roles-list", methods=["GET"])
 @require_admin
+@audit_action("ROLES_VIEWED", resource_type="role")
 def get_roles_list():
     resp = _exec(supabase.table("roles").select("id, name, permissions").order("name"))
     rows = resp.data or []
@@ -777,6 +771,7 @@ def get_roles_list():
 
 @role_bp.route("/api/roles/<int:role_id>", methods=["GET"])
 @require_admin
+@audit_action("ROLE_VIEWED", resource_type="role")
 def get_role(role_id):
     row = get_role_by_id(role_id)
     if not row:
@@ -794,6 +789,7 @@ def get_role(role_id):
 
 @role_bp.route("/api/roles", methods=["POST"])
 @require_admin
+@audit_action("ROLE_CREATED", resource_type="role")
 def create_role():
     data            = request.json or {}
     name            = (data.get("name") or "").strip()
@@ -817,6 +813,10 @@ def create_role():
     if get_role_by_name(name):
         return jsonify({"error": "Role name already exists"}), 409
 
+    set_audit_context(
+        new_value={"name": name, "description": description, "permissions": permissions},
+        resource_id=name,
+    )
     try:
         _exec(supabase.table("roles").insert({
             "name": name,
@@ -828,6 +828,10 @@ def create_role():
 
     row = get_role_by_name(name)
     perms = parse_permissions(row["permissions"])
+    set_audit_context(
+        new_value={"name": name, "description": description, "permissions": perms},
+        resource_id=row["id"],
+    )
     return jsonify({
         "message": "Role created",
         "role": {
@@ -843,6 +847,7 @@ def create_role():
 
 @role_bp.route("/api/roles/<int:role_id>", methods=["PUT"])
 @require_admin
+@audit_action("ROLE_UPDATED", resource_type="role")
 def update_role(role_id):
     data            = request.json or {}
     name            = (data.get("name") or "").strip()
@@ -866,6 +871,16 @@ def update_role(role_id):
 
     if name != existing["name"] and get_role_by_name(name):
         return jsonify({"error": "Role name already exists"}), 409
+
+    set_audit_context(
+        old_value={
+            "role_name": existing.get("name"),
+            "description": existing.get("description"),
+            "permissions": parse_permissions(existing.get("permissions")),
+        },
+        new_value={"role_name": name, "description": description, "permissions": permissions},
+        resource_id=role_id,
+    )
 
     # ─── FIX: snapshot old per-username categories for this role BEFORE
     # updating, so that if this edit moves the role into a different
@@ -945,6 +960,7 @@ def update_role(role_id):
 
 @role_bp.route("/api/roles/<int:role_id>", methods=["DELETE"])
 @require_admin
+@audit_action("ROLE_DELETED", resource_type="role")
 def delete_role(role_id):
     row = get_role_by_id(role_id)
     if not row:
@@ -952,6 +968,16 @@ def delete_role(role_id):
 
     if row["name"] in BUILTIN_ROLE_PERMISSIONS:
         return jsonify({"error": f"Cannot delete built-in role '{row['name']}'"}), 400
+
+    set_audit_context(
+        old_value={
+            "role_name": row.get("name"),
+            "description": row.get("description"),
+            "permissions": parse_permissions(row.get("permissions")),
+        },
+        new_value=None,
+        resource_id=role_id,
+    )
 
     # Scoped by role_id, so only assignments OF THIS ROLE go away. Any other
     # role the same usernames hold in another category is untouched.
@@ -962,6 +988,7 @@ def delete_role(role_id):
 
 @role_bp.route("/api/modules", methods=["GET"])
 @require_admin
+@audit_action("ADMIN_MODULES_VIEWED", resource_type="access_control")
 def get_modules():
     return jsonify({
         "all":        ALL_MODULES,
@@ -973,6 +1000,7 @@ def get_modules():
 
 @role_bp.route("/api/administrators", methods=["GET"])
 @require_admin
+@audit_action("ADMINISTRATORS_VIEWED", resource_type="account")
 def get_administrators():
     """Current holders of the (capped) Administrator role, excluding the
     reserved bootstrap 'admin' account. Used to populate the two
@@ -985,6 +1013,7 @@ def get_administrators():
 
 @role_bp.route("/api/administrators", methods=["PUT"])
 @require_admin
+@audit_action("ADMINISTRATORS_UPDATED", resource_type="account")
 def set_administrators():
     """Sets EXACTLY the two Administrator slots to the given usernames.
     Anyone else currently holding Administrator (other than the reserved
@@ -1030,6 +1059,11 @@ def set_administrators():
     # incoming usernames, back to having no role assigned — in the admin
     # category only; their Vital/Document assignments (if any) are untouched.
     current_admins = get_current_admin_usernames()
+    set_audit_context(
+        old_value={"administrators": current_admins},
+        new_value={"administrators": [slot1, slot2]},
+        resource_id="Administrator",
+    )
     for uname in current_admins:
         if uname not in (slot1, slot2):
             _delete_user_role_scoped(uname, "admin")
@@ -1056,6 +1090,7 @@ def set_administrators():
 
 @role_bp.route("/api/user-roles", methods=["GET"])
 @require_admin
+@audit_action("USER_ROLES_VIEWED", resource_type="user_role")
 def get_user_roles():
     # ─── CREDENTIAL CATEGORY SEPARATION (NEW) ──────────────────────────────
     # `category` is selected and returned per row so the frontend can put
@@ -1129,6 +1164,7 @@ def get_user_roles():
 
 @role_bp.route("/api/user-roles", methods=["POST"])
 @require_admin
+@audit_action("USER_ROLE_ASSIGNED", resource_type="user_role")
 def assign_role():
     data     = request.json or {}
     username = (data.get("username") or "").strip()
@@ -1205,6 +1241,18 @@ def assign_role():
     #     explaining that passwords are shared until the migration is run.
     users_scoped = _user_category_column_available()
 
+    try:
+        previous_query = (
+            supabase.table("user_roles")
+            .select("username, role_id, category")
+            .eq("username", username)
+            .eq("category", category)
+        )
+        previous_assignment = _exec(previous_query).data or []
+    except Exception as e:
+        previous_assignment = []
+        print(f"[ROLES] Could not read previous assignment for audit: {e!r}")
+
     if users_scoped:
         existing_cred = get_user_by_username_category(username, category)
     else:
@@ -1230,6 +1278,14 @@ def assign_role():
                 insert_payload["category"] = category
             _exec(supabase.table("users").insert(insert_payload))
             account_created = True
+            record_action(
+                "ACCOUNT_CREATED",
+                "Credential account created during role assignment",
+                meta={"target_username": username, "category": category},
+                resource_type="account",
+                resource_id=username,
+                new_value={"username": username, "category": category},
+            )
         except Exception as e:
             # A duplicate-key error here means a UNIQUE(username) constraint
             # still exists on `users` even though the category column does.
@@ -1251,6 +1307,18 @@ def assign_role():
     # is left untouched here — changing a password goes through the
     # dedicated "Reset Password" action (reset_password below), which is
     # itself scoped to this same (username, category) pair.
+
+    set_audit_context(
+        old_value=previous_assignment[0] if previous_assignment else None,
+        new_value={
+            "username": username,
+            "role_id": role_id,
+            "role_name": role.get("name"),
+            "category": category,
+            "account_created": account_created,
+        },
+        resource_id=username,
+    )
 
     # Previously this deleted EVERY existing user_roles row for `username`
     # before inserting the new one — so assigning a Document Tracking role
@@ -1328,6 +1396,7 @@ def _other_category_rows(username: str, category: str) -> dict:
 
 @role_bp.route("/api/user-roles/<username>", methods=["DELETE"])
 @require_admin
+@audit_action("USER_ROLE_REMOVED", resource_type="user_role")
 def remove_user_role(username):
     caller = session.get("username")
     if caller == username:
@@ -1387,6 +1456,27 @@ def remove_user_role(username):
             )
         }), 400
 
+    try:
+        previous_query = (
+            supabase.table("user_roles")
+            .select("username, role_id")
+            .eq("username", username)
+        )
+        if role_id:
+            previous_query = previous_query.eq("role_id", role_id)
+        if category_filter_applicable:
+            previous_query = previous_query.eq("category", category)
+        previous_assignment = _exec(previous_query).data or []
+    except Exception as e:
+        previous_assignment = []
+        print(f"[ROLES] Could not read removed assignment for audit: {e!r}")
+    set_audit_context(
+        old_value=previous_assignment[0] if previous_assignment else None,
+        new_value=None,
+        resource_id=username,
+        meta={"category": category, "role_id": role_id},
+    )
+
     query = supabase.table("user_roles").delete().eq("username", username)
     if role_id:
         query = query.eq("role_id", role_id)
@@ -1405,6 +1495,7 @@ def remove_user_role(username):
 
 @role_bp.route("/api/user-roles/<username>/reset-password", methods=["PUT"])
 @require_admin
+@audit_action("PASSWORD_RESET", resource_type="account")
 def reset_password(username):
     data     = request.json or {}
     password = (data.get("password") or "").strip()
@@ -1425,8 +1516,15 @@ def reset_password(username):
     if _user_category_column_available():
         if not category or category not in KNOWN_CATEGORIES:
             return jsonify({"error": "A valid category is required to reset this credential's password"}), 400
-        if not get_user_by_username_category(username, category):
+        existing_user = get_user_by_username_category(username, category)
+        if not existing_user:
             return jsonify({"error": "User not found"}), 404
+        set_audit_context(
+            old_value={"credential_exists": bool(existing_user.get("password"))},
+            new_value={"credential_reset": True},
+            resource_id=username,
+            meta={"category": category},
+        )
         _exec(supabase.table("users").update({
             "password":       hash_password(password),
             "login_attempts": 0,
@@ -1439,8 +1537,14 @@ def reset_password(username):
         # (one shared account/password per username). `category` is simply
         # ignored here rather than rejected, so the frontend can always send
         # it and this keeps working either way.
-        if not get_user_by_username(username):
+        existing_user = get_user_by_username(username)
+        if not existing_user:
             return jsonify({"error": "User not found"}), 404
+        set_audit_context(
+            old_value={"credential_exists": bool(existing_user.get("password"))},
+            new_value={"credential_reset": True},
+            resource_id=username,
+        )
         _exec(supabase.table("users").update({
             "password":       hash_password(password),
             "login_attempts": 0,
@@ -1454,6 +1558,7 @@ def reset_password(username):
 
 @role_bp.route("/api/user-roles/<username>/unlock", methods=["PUT"])
 @require_admin
+@audit_action("ACCOUNT_UNLOCKED", resource_type="account")
 def unlock_user(username):
     # ─── PER-CATEGORY PASSWORDS (NEW) ──────────────────────────────────────
     # Lock state (login_attempts / lock_level / lock_time) now belongs to
@@ -1465,8 +1570,19 @@ def unlock_user(username):
     if _user_category_column_available():
         if not category or category not in KNOWN_CATEGORIES:
             return jsonify({"error": "A valid category is required to unlock this credential"}), 400
-        if not get_user_by_username_category(username, category):
+        user = get_user_by_username_category(username, category)
+        if not user:
             return jsonify({"error": "User not found"}), 404
+        set_audit_context(
+            old_value={
+                "login_attempts": user.get("login_attempts"),
+                "lock_level": user.get("lock_level"),
+                "lock_time": user.get("lock_time"),
+            },
+            new_value={"login_attempts": 0, "lock_level": 0, "lock_time": None},
+            resource_id=username,
+            meta={"category": category},
+        )
         _exec(supabase.table("users").update({
             "login_attempts": 0,
             "temp_attempts":  0,
@@ -1475,8 +1591,18 @@ def unlock_user(username):
         }).eq("username", username).eq("category", category))
     else:
         # Pre-migration fallback — matches the old, username-only behaviour.
-        if not get_user_by_username(username):
+        user = get_user_by_username(username)
+        if not user:
             return jsonify({"error": "User not found"}), 404
+        set_audit_context(
+            old_value={
+                "login_attempts": user.get("login_attempts"),
+                "lock_level": user.get("lock_level"),
+                "lock_time": user.get("lock_time"),
+            },
+            new_value={"login_attempts": 0, "lock_level": 0, "lock_time": None},
+            resource_id=username,
+        )
         _exec(supabase.table("users").update({
             "login_attempts": 0,
             "temp_attempts":  0,
@@ -1534,40 +1660,4 @@ def my_permissions():
     return jsonify(payload)
 
 
-# --- LOGOUT -------------------------------------------------------------------
-@role_bp.route("/api/logout", methods=["POST"])
-def logout():
-    username = session.get("username")
-    if username:
-        try:
-            _exec(supabase.table("users").update({
-                "is_online":   False,
-                "last_logout": now_iso(),
-            }).eq("username", username))
-        except Exception as e:
-            # Don't let a transient Supabase/network hiccup prevent the
-            # session from actually being cleared — the user must always
-            # be able to log out cleanly even if the "last seen"
-            # bookkeeping update itself fails. Without this try/except the
-            # exception would propagate to the blueprint error handler
-            # (returning a 503 before session.clear() runs), leaving the
-            # client and server in an inconsistent "am I logged in?" state.
-            print(f"[ROLES] logout: failed to update is_online for '{username}': {e!r}")
-
-    session.clear()
-    return jsonify({"message": "Logged out successfully"})
-
-
-@role_bp.route("/api/logout-beacon", methods=["POST"])
-def logout_beacon():
-    username = session.get("username")
-    if username:
-        try:
-            _exec(supabase.table("users").update({
-                "is_online":   False,
-                "last_logout": now_iso(),
-            }).eq("username", username))
-        except Exception as e:
-            print(f"[ROLES] logout_beacon: failed to update is_online for '{username}': {e!r}")
-    return ("", 204)
 # -*- coding: utf-8 -*-

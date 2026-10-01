@@ -6,10 +6,10 @@ import time
 from datetime import datetime, timezone
 from functools import wraps
 
-from flask import Blueprint, has_request_context, jsonify, request, session
+from flask import Blueprint, g, has_request_context, jsonify, request, session
 
 from supabase_client import supabase
-from auth.Rolemanagement import require_admin
+from security import require_admin
 
 audit_bp = Blueprint("audit_bp", __name__)
 _logger = logging.getLogger(__name__)
@@ -79,11 +79,15 @@ def scrub_sensitive(value, key=None):
         return mask_name(value)
     if "email" in key_text:
         return mask_email(value)
-    if any(token in key_text for token in ("nationalid", "passport", "identitynumber", "registry no", "registryno", "tin")):
+    if key_text == "tin":
+        return mask_identifier(value)
+    if any(token in key_text for token in ("nationalid", "passport", "identitynumber", "registryno")):
         return mask_identifier(value)
     if (
         key_text.endswith("name")
-        and key_text not in {"filename", "documentname", "modulename", "resourcename"}
+        and key_text not in {
+            "username", "rolename", "filename", "documentname", "modulename", "resourcename"
+        }
     ):
         return mask_name(value)
     if isinstance(value, dict):
@@ -174,6 +178,17 @@ def record_action(
         print(f"[AUDIT RECORD ERROR] {e}", flush=True)
 
 
+def set_audit_context(*, old_value=None, new_value=None, resource_id=None, meta=None):
+    """Attach safe transition details for the current route's audit decorator."""
+    if has_request_context():
+        g._audit_context = {
+            "old_value": old_value,
+            "new_value": new_value,
+            "resource_id": resource_id,
+            "meta": meta or {},
+        }
+
+
 def _response_status(result):
     if isinstance(result, tuple):
         for item in result[1:]:
@@ -193,6 +208,7 @@ def audit_action(action, resource_type=None, description=None):
                 result = fn(*args, **kwargs)
             except Exception as exc:
                 route_args = getattr(request, "view_args", None) or {}
+                context = getattr(g, "_audit_context", {})
                 resource_id = next(
                     (route_args[key] for key in (
                         "record_id", "document_id", "payment_id", "role_id", "handler_id", "id"
@@ -204,8 +220,14 @@ def audit_action(action, resource_type=None, description=None):
                     description or action.replace("_", " ").title(),
                     status="FAILED",
                     resource_type=resource_type,
-                    resource_id=resource_id,
-                    meta={"route": request.path, "error_type": type(exc).__name__},
+                    resource_id=context.get("resource_id", resource_id),
+                    old_value=context.get("old_value"),
+                    new_value=context.get("new_value"),
+                    meta={
+                        "route": request.path,
+                        "error_type": type(exc).__name__,
+                        **context.get("meta", {}),
+                    },
                 )
                 raise
 
@@ -214,6 +236,7 @@ def audit_action(action, resource_type=None, description=None):
                 "FAILED" if status_code >= 400 else "SUCCESS"
             )
             route_args = getattr(request, "view_args", None) or {}
+            context = getattr(g, "_audit_context", {})
             resource_id = next(
                 (route_args[key] for key in (
                     "record_id", "document_id", "payment_id", "role_id", "handler_id", "id"
@@ -225,8 +248,14 @@ def audit_action(action, resource_type=None, description=None):
                 description or action.replace("_", " ").title(),
                 status=event_status,
                 resource_type=resource_type,
-                resource_id=resource_id,
-                meta={"route": request.path, "method": request.method},
+                resource_id=context.get("resource_id", resource_id),
+                old_value=context.get("old_value"),
+                new_value=context.get("new_value"),
+                meta={
+                    "route": request.path,
+                    "method": request.method,
+                    **context.get("meta", {}),
+                },
             )
             return result
         return wrapped
@@ -267,6 +296,43 @@ def get_history():
     except Exception as e:
         print(f"[AUDIT HISTORY ERROR] {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@audit_bp.route("/api/audit/access-denied", methods=["POST"])
+def record_client_access_denied():
+    """Record a client-side permission guard denial using server identity."""
+    username = session.get("username")
+    if not username:
+        return jsonify({"error": "Not logged in"}), 401
+
+    body = request.get_json(silent=True) or {}
+    attempted_route = body.get("route")
+    if (
+        not isinstance(attempted_route, str)
+        or not attempted_route.startswith("/")
+        or len(attempted_route) > 300
+        or "://" in attempted_route
+    ):
+        return jsonify({"error": "A local route path is required"}), 400
+
+    if should_dedupe("ACCESS_DENIED", session.get("user_id"), username):
+        return "", 204
+
+    role = session.get("role") or (
+        "Administrator" if session.get("is_admin") else None
+    )
+    record_action(
+        "ACCESS_DENIED",
+        "Frontend permission guard denied route access",
+        username=username,
+        user_id=session.get("user_id"),
+        role=role,
+        status="DENIED",
+        resource_type="route",
+        resource_id=attempted_route,
+        meta={"route": attempted_route, "source": "frontend_permission_guard"},
+    )
+    return "", 204
 
 
 # Audit writes are server-side only; audit history is append-only.
