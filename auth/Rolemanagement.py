@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 # Rolemanagement.py
-import os
-import sys
 import json
 import time
 from datetime import datetime, timezone
@@ -9,7 +7,6 @@ from functools import wraps
 
 import httpx
 from flask import Blueprint, request, jsonify, session
-from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash, check_password_hash
 

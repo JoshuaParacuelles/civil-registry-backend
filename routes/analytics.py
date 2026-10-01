@@ -85,35 +85,19 @@ PAYMENT_TABLES = {
         "columns": "amount, payment_status, payment_date, payment_method",
         "amount_col": "amount",
         "date_col": "payment_date",
-        "status_col": "payment_status",
     },
     "marriage_records": {
         "table": "marriage_transactions",
         "columns": "payment_amount, record_status, created_at, payment_method",
         "amount_col": "payment_amount",
         "date_col": "created_at",
-        "status_col": "record_status",
     },
     "death_records": {
         "table": "death_transactions",
         "columns": "payment_amount, record_status, created_at, payment_method",
         "amount_col": "payment_amount",
         "date_col": "created_at",
-        "status_col": "record_status",
     },
-}
-
-# NOTE on status_col ("payment_status" / "record_status"):
-# It does NOT indicate whether a payment succeeded -- every row is written only
-# after the fee (P75) has been collected. It records whether the searched civil
-# registry record was FOUND ("positive") or a Negative Certificate was issued
-# ("negative"). Revenue therefore sums every row unconditionally
-# (see payment_stats_today). The helpers below are kept for anything that
-# specifically needs "record found vs not found".
-POSITIVE_PAYMENT_STATUSES = {
-    "positive", "paid", "success", "successful", "completed", "complete",
-    "approved", "verified", "released", "confirmed", "confirm", "done",
-    "true", "1", "yes",
 }
 
 
@@ -136,17 +120,8 @@ def _require_login():
 # CACHE
 # ══════════════════════════════════════════════════════════════════════════
 #
-# Key conventions (used by invalidate_analytics_cache):
-#   ("records", table)          raw record rows
-#   ("payments", table)         raw payment rows
-#   ("recent-payments", table)  today-window payment rows
-#   ("recent-records", table)   today-window record rows
-#   ("count", table)            exact row counts
-#   ("agg", name)               computed endpoint results
-#
 # The cache is PER WORKER PROCESS. With several gunicorn workers,
-# invalidate_analytics_cache() only clears the worker that handled the write;
-# the others rely on the short TTLs. Use Redis if you need strict consistency.
+# each worker relies on the short TTLs. Use Redis if strict consistency is needed.
 
 _CACHE = {}
 _CACHE_LOCKS = {}
@@ -194,54 +169,20 @@ def cached(key, ttl, loader, max_stale=MAX_STALE_SECONDS):
 
 
 def invalidate_analytics_cache(record_table=None):
-    """
-    Drop cached analytics data so the next request reloads from Supabase.
-
-    Call this from the upload / transaction routes right after a successful write:
-
-        from routes.analytics import invalidate_analytics_cache
-        invalidate_analytics_cache("birth_records")   # one record type
-        invalidate_analytics_cache()                  # everything
-
-    Computed aggregates ("agg") are always dropped because they depend on
-    every table.
-    """
+    """Drop cached analytics data after a successful record or payment write."""
     with _CACHE_GUARD:
-        for k in list(_CACHE):
+        for key in list(_CACHE):
             if (
                 record_table is None
-                or k[0] == "agg"
-                or (len(k) > 1 and k[1] == record_table)
+                or key[0] == "agg"
+                or (len(key) > 1 and key[1] == record_table)
             ):
-                _CACHE.pop(k, None)
+                _CACHE.pop(key, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # DATE PARSING HELPERS
 # ══════════════════════════════════════════════════════════════════════════
-
-def _parse_month_value(val):
-    """Accepts numeric ('3'), zero-padded ('03'), or name ('March'/'mar') months."""
-    if val is None:
-        return None
-    s = str(val).strip().lower()
-    if not s:
-        return None
-    if s.isdigit():
-        n = int(s)
-        return n if 1 <= n <= 12 else None
-    return MONTH_NAME_TO_NUM.get(s)
-
-
-def _parse_int_year(val):
-    if val is None:
-        return None
-    s = str(val).strip()
-    if not s or not s.isdigit():
-        return None
-    n = int(s)
-    return n if 1900 <= n <= 2100 else None
-
 
 def parse_flexible_date(date_val):
     """
@@ -377,40 +318,6 @@ def _rolling_months(n, anchor=None):
     return [_month_add(anchor.year, anchor.month, -i) for i in range(n - 1, -1, -1)]
 
 
-def _resolve_birth_ym(row):
-    r = parse_flexible_date(row.get("birth_date"))
-    if r:
-        return r
-    yr = _parse_int_year(row.get("birth_year"))
-    if yr:
-        return (yr, _parse_month_value(row.get("birth_month")) or 1)
-    return parse_flexible_date(row.get(UPLOAD_COL))
-
-
-def _resolve_marriage_ym(row):
-    yr = _parse_int_year(row.get("marriage_year"))
-    if yr:
-        return (yr, _parse_month_value(row.get("marriage_month")) or 1)
-    return parse_flexible_date(row.get(UPLOAD_COL))
-
-
-def _resolve_death_ym(row):
-    r = parse_flexible_date(row.get("date_of_death"))
-    if r:
-        return r
-    return parse_flexible_date(row.get(UPLOAD_COL))
-
-
-# Person's actual vital-event date. Intentionally NOT used by the charts
-# below (they use upload date or request date). Kept for a future
-# "demographic seasonality" report.
-EVENT_RESOLVERS = {
-    "birth_records": _resolve_birth_ym,
-    "marriage_records": _resolve_marriage_ym,
-    "death_records": _resolve_death_ym,
-}
-
-
 def _resolve_place(table_name, row):
     for col in PLACE_COLUMNS[table_name]:
         val = row.get(col)
@@ -435,13 +342,6 @@ def _to_amount(val):
         return float(cleaned)
     except (TypeError, ValueError):
         return 0.0
-
-
-def _is_positive_payment(val):
-    """True if `val` is a 'record found / success' style status label."""
-    if val is None:
-        return False
-    return str(val).strip().lower() in POSITIVE_PAYMENT_STATUSES
 
 
 def _to_bool_or_none(val):
@@ -574,6 +474,11 @@ def fetch_all_rows(table_name):
     )
 
 
+def active_rows(table_name, include_archived=True):
+    """Return all rows; archive state does not exclude analytics records."""
+    return fetch_all_rows(table_name)
+
+
 def fetch_payment_rows(record_table_name):
     """Every row of the payment/transaction table for the given record table."""
     cfg = PAYMENT_TABLES[record_table_name]
@@ -637,16 +542,6 @@ def _count_exact(table_name):
         return len(fetch_all_rows(table_name))
 
     return cached(("count", table_name), TTL_COUNT, load)
-
-
-# is_archived is a WORKFLOW state (Archive tab inbox), not a validity flag, so
-# analytics always include every row regardless of it.
-def _is_active(row, include_archived):
-    return True
-
-
-def active_rows(table_name, include_archived=True):
-    return [r for r in fetch_all_rows(table_name) if _is_active(r, include_archived)]
 
 
 def table_counts(table_name, include_archived=True):
@@ -894,11 +789,6 @@ def summary():
     return _cached_route("summary", TTL_AGG_TODAY, _compute_summary, "summary")
 
 
-@analytics_bp.route("/api/analytics/document-types", methods=["GET"])
-def document_types():
-    return _cached_route("document-types", TTL_COUNT, _compute_document_types, "document-types")
-
-
 @analytics_bp.route("/api/analytics/records-by-year", methods=["GET"])
 def records_by_year():
     return _cached_route("records-by-year", TTL_AGG_HEAVY, _compute_records_by_year, "records-by-year")
@@ -932,6 +822,11 @@ def requests_by_month():
 @analytics_bp.route("/api/analytics/growth-rate", methods=["GET"])
 def growth_rate():
     return _cached_route("growth-rate", TTL_AGG_HEAVY, _compute_growth_rate, "growth-rate")
+
+
+@analytics_bp.route("/api/analytics/document-types", methods=["GET"])
+def document_types():
+    return _cached_route("document-types", TTL_COUNT, _compute_document_types, "document-types")
 
 
 @analytics_bp.route("/api/analytics/debug-counts", methods=["GET"])
