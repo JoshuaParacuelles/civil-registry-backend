@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, session
 from supabase_client import supabase
 from auth.Rolemanagement import is_admin, get_user_permissions
+from security import audit_denial
 
 document_bp = Blueprint("document", __name__, url_prefix="/api/documents")
 
@@ -133,6 +134,7 @@ def current_username():
 def require_login():
     """Returns an error response tuple if not logged in, else None."""
     if not current_username():
+        audit_denial("Document Tracking route requires authentication")
         return jsonify({"error": "Not authenticated"}), 401
     return None
 
@@ -155,6 +157,7 @@ def block_if_admin():
     follow.
     """
     if is_admin(current_username()):
+        audit_denial("Administrators are view-only for document processing")
         return jsonify({"error": "Admins have view-only access to Document Tracking"}), 403
     return None
 
@@ -248,6 +251,7 @@ def block_if_no_stage_permission(stage):
     perms = get_user_permissions(current_username())
     if "*" in perms or required_permission in perms:
         return None
+    audit_denial("Required document stage permission missing")
     return (
         jsonify({
             "error": "Access denied — your role does not include this Document Tracking stage"
@@ -394,6 +398,7 @@ def require_admin():
     actions, not something a handler grants themselves.
     """
     if not is_admin(current_username()):
+        audit_denial("Document Tracking admin privileges required")
         return jsonify({"error": "Admin access required"}), 403
     return None
 

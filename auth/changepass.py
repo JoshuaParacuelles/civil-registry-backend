@@ -3,7 +3,7 @@ from flask import Blueprint, request, jsonify, session
 from flask_cors import CORS
 import bcrypt
 from werkzeug.security import generate_password_hash, check_password_hash
-from logs.Audits import record_action
+from logs.Audits import audit_action, set_audit_context
 from supabase_client import supabase
 
 changepass_bp = Blueprint("changepass_bp", __name__)
@@ -146,23 +146,8 @@ def _supabase_error_response(e):
     return _err("Database error. Please try again.", "SERVER_ERROR", 500)
 
 
-@changepass_bp.route("/api/current-user", methods=["GET"])
-def current_user():
-    username = session.get("username")
-    if not username:
-        return _err("Not logged in", "NOT_LOGGED_IN", 401)
-
-    try:
-        res = supabase.table("users").select("username").eq("username", username).limit(1).execute()
-        if res.data:
-            return jsonify({"username": res.data[0]["username"]}), 200
-        return jsonify({"username": username}), 200
-    except Exception as e:
-        print("[CURRENT USER ERROR]", e)
-        return jsonify({"username": username}), 200
-
-
 @changepass_bp.route("/api/change-password", methods=["POST"])
+@audit_action("PASSWORD_CHANGED", resource_type="account")
 def change_password():
     data = request.get_json(silent=True) or {}
 
@@ -170,7 +155,6 @@ def change_password():
     current_password = (data.get("currentPassword") or "").strip()
     new_password      = (data.get("newPassword") or "").strip()
     new_username      = (data.get("newUsername") or "").strip()
-    ip                = request.remote_addr
 
     print(f"[change_password] session username='{current_username}'")
 
@@ -192,16 +176,19 @@ def change_password():
     user = res.data[0]
     stored_password = user["password"]
     print(f"[change_password] fetched row for username='{user['username']}' id={user['id']}")
+    requested_username = (new_username or current_username).strip() or current_username
+    set_audit_context(
+        old_value={"username": current_username},
+        new_value={
+            "username": requested_username,
+            "password_change_requested": bool(new_password),
+        },
+        resource_id=user["id"],
+    )
 
     password_ok = _verify_password(current_password, stored_password)
 
     if not password_ok:
-        record_action(
-            "ACCOUNT_UPDATE",
-            "Failed account update — wrong current password",
-            username=current_username,
-            ip=ip
-        )
         return _err("Current password incorrect", "INVALID_PASSWORD", 403)
 
     if not new_username:
@@ -248,15 +235,6 @@ def change_password():
 
     session["username"] = new_username
 
-    if changing_username and changing_password:
-        desc = f"Username changed: {current_username} -> {new_username} | Password also changed"
-    elif changing_username:
-        desc = f"Username changed: {current_username} -> {new_username}"
-    else:
-        desc = f"Password changed for user: {current_username}"
-
-    record_action("ACCOUNT_UPDATE", desc, username=new_username, ip=ip)
-
     return jsonify({
         "success": True,
         "message": "Account updated successfully",
@@ -265,14 +243,13 @@ def change_password():
 
 
 @changepass_bp.route("/api/change-module-password", methods=["POST"])
+@audit_action("MODULE_PASSWORD_CHANGED", resource_type="module_password")
 def change_module_password():
     data = request.get_json(silent=True) or {}
 
     module     = (data.get("module") or "").strip()
     current_pw = (data.get("currentPassword") or "").strip()
     new_pw     = (data.get("newPassword") or "").strip()
-    ip         = request.remote_addr
-    username   = session.get("username", "unknown")
 
     if module not in VALID_MODULES:
         return _err("Unknown module.", "VALIDATION_ERROR", 400)
@@ -309,12 +286,6 @@ def change_module_password():
         return _err("Password record is invalid or corrupted.", "SERVER_ERROR", 500)
 
     if not _verify_bcrypt(current_pw, stored_hash):
-        record_action(
-            "MODULE_PASSWORD_UPDATE",
-            f"Failed module password change for '{module}' — wrong current password",
-            username=username,
-            ip=ip
-        )
         return _err("Current password is incorrect.", "INVALID_PASSWORD", 403)
 
     new_hash = _hash_bcrypt(new_pw)
@@ -327,13 +298,6 @@ def change_module_password():
         return _supabase_error_response(e)
 
     label = VALID_MODULES.get(module, module)
-    record_action(
-        "MODULE_PASSWORD_UPDATE",
-        f"Password updated for module: {module}",
-        username=username,
-        ip=ip
-    )
-
     return jsonify({
         "success": True,
         "message": f"{label} password updated successfully."

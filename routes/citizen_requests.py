@@ -73,6 +73,7 @@ from supabase_client import supabase
 from auth.Rolemanagement import is_admin, get_user_permissions
 from .email_service import send_status_update_email
 from logs.Audits import record_action
+from security import audit_denial
 
 citizen_requests_bp = Blueprint("citizen_requests_bp", __name__)
 
@@ -119,12 +120,14 @@ def _staff_required(fn):
     def wrapper(*args, **kwargs):
         username = session.get("username")
         if not username:
+            audit_denial("Citizen request route requires authentication")
             return jsonify({"error": "Not logged in"}), 401
         if is_admin(username):
             return fn(*args, **kwargs)
         perms = get_user_permissions(username) or []
         if REQUIRED_PERMISSION in perms or "*" in perms:
             return fn(*args, **kwargs)
+        audit_denial("Citizen request permission required")
         return jsonify({"error": "Forbidden"}), 403
     return wrapper
 

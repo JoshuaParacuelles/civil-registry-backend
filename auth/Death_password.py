@@ -1,6 +1,7 @@
 import bcrypt
 from flask import Blueprint, jsonify, request
 
+from logs.Audits import audit_action, set_audit_context
 from supabase_client import supabase
 
 death_archive_bp = Blueprint("death_archive", __name__)
@@ -46,11 +47,13 @@ def init_death_archive_db():
 # ─── VERIFY PASSWORD ──────────────────────────────────────────────────────────
 
 @death_archive_bp.route("/api/death/auth/verify", methods=["POST"])
+@audit_action("MODULE_PASSWORD_VERIFICATION", resource_type="module_password")
 def verify_module_password():
     try:
         data = request.get_json(silent=True) or {}
         module = data.get("module", "").strip()
         password = data.get("password", "").strip()
+        set_audit_context(resource_id=module or "death_module", meta={"module": module})
 
         if module not in SEED_MODULES:
             return jsonify({"success": False, "message": "Unknown module."}), 400
@@ -91,12 +94,14 @@ def verify_module_password():
 # ─── CHANGE PASSWORD ──────────────────────────────────────────────────────────
 
 @death_archive_bp.route("/api/death/change-module-password", methods=["POST"])
+@audit_action("MODULE_PASSWORD_CHANGED", resource_type="module_password")
 def change_module_password():
     try:
         data = request.get_json(silent=True) or {}
         module = data.get("module", "").strip()
         current_password = data.get("currentPassword", "").strip()
         new_password = data.get("newPassword", "").strip()
+        set_audit_context(resource_id=module or "death_module", meta={"module": module})
 
         if module not in SEED_MODULES:
             return jsonify({"success": False, "message": "Unknown module."}), 400
