@@ -189,7 +189,7 @@ _keepalive_started = False
 _keepalive_lock    = threading.Lock()
 
 
-def _start_keepalive_thread(app):
+def _start_keepalive_thread():
     """Call once after app startup. Safe to call multiple times."""
     global _keepalive_started
     with _keepalive_lock:
@@ -541,7 +541,7 @@ def delete_notification(notif_id: int):
 @notifications_bp.route("/api/notifications/stream")
 def sse_stream():
     try:
-        _start_keepalive_thread(current_app._get_current_object())
+        _start_keepalive_thread()
     except Exception:
         pass
 

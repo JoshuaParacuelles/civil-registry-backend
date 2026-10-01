@@ -298,7 +298,7 @@ def get_entity(id):
 @external_bp.route("/health", methods=["GET"])
 def health_check():
     """Quick check that the integration is reachable."""
-    data, err, status = _scims_get("/individual", params={"page": 1})
+    _, err, status = _scims_get("/individual", params={"page": 1})
     body = {
         "reachable": err is None,
         "base_url": SCIMS_BASE_URL,

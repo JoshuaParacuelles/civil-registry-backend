@@ -271,7 +271,7 @@ def block_if_no_stage_permission(stage):
 # user given the "Registration" role in Role Management still showed
 # "Unsigned" there.
 #
-# _get_stage_handler_username() below closes that gap: for a given
+# _get_stage_handler_usernames() below closes that gap: for each
 # document_stage_* permission, it finds the username currently holding a
 # Document Tracking role that grants it, and get_document_detail() uses
 # that username as the stage's displayed handler when one is found. It
@@ -292,9 +292,9 @@ _DOC_CATEGORY_COLUMN_OK = None
 def _document_category_column_available():
     """
     ROLE-BASED HANDLER FIX: True when user_roles.category exists, so
-    _get_stage_handler_username() / _get_stage_handler_usernames()
-    below can scope their lookup to category="document" (Document
-    Tracking Credentials only). Probed once per process and cached,
+    _get_stage_handler_usernames() can scope its lookup to
+    category="document" (Document Tracking Credentials only). Probed once
+    per process and cached,
     mirroring the same probe pattern already used in
     auth/Rolemanagement.py for this exact column.
     """
@@ -309,71 +309,12 @@ def _document_category_column_available():
     return _DOC_CATEGORY_COLUMN_OK
 
 
-def _get_stage_handler_username(permission):
-    """
-    ROLE-BASED HANDLER FIX: returns the username currently holding a
-    Document Tracking role that grants `permission` (e.g.
-    "document_stage_registration"), or None if nobody currently does.
-
-    Reads user_roles joined with roles(name, permissions) — the exact
-    same data Role Management's "Document Tracking Credentials" tab is
-    built from — rather than document_personnel, so this reflects
-    whoever was actually assigned there (see Image 1: assigning
-    "jamaica" the "Registration" role is what should make jamaica show
-    up as "Currently handling" on the Registration stage).
-
-    Deliberately skips the Administrator role and the reserved "admin"
-    account: Administrator's permission list is ALL_MODULES, so without
-    this exclusion every stage would resolve to "admin" instead of the
-    actual assigned user.
-
-    NOTE: kept as a single-permission lookup for any other/future
-    caller that only needs one permission resolved. get_document_detail()
-    below no longer calls this in a per-stage loop — see the
-    PER-REQUEST QUERY-COUNT FIX and _get_stage_handler_usernames()
-    just below for why, and for the batched version it uses instead.
-    """
-    if not permission:
-        return None
-    try:
-        query = supabase.table("user_roles").select("username, roles(name, permissions)")
-        if _document_category_column_available():
-            query = query.eq("category", "document")
-        res = execute_with_retry(query)
-    except Exception:
-        logger.exception("Failed to resolve role-based handler for permission %s", permission)
-        return None
-
-    for row in (res.data or []):
-        role = row.get("roles")
-        if isinstance(role, list):
-            role = role[0] if role else None
-        if not role:
-            continue
-        if (role.get("name") or "") == "Administrator":
-            continue
-        raw_perms = role.get("permissions")
-        if isinstance(raw_perms, str):
-            try:
-                import json
-                raw_perms = json.loads(raw_perms)
-            except Exception:
-                raw_perms = []
-        if raw_perms and permission in raw_perms:
-            username = row.get("username")
-            if username and username.lower() != "admin":
-                return username
-    return None
-
-
 def _get_stage_handler_usernames(permissions):
     """
-    PER-REQUEST QUERY-COUNT FIX (NEW): batched counterpart to
-    _get_stage_handler_username() above.
+    Resolve every stage permission in one Supabase query.
 
-    get_document_detail() used to call _get_stage_handler_username()
-    once per stage — a fresh user_roles/roles Supabase query every
-    single time. For the current 6-stage workflow (Registration,
+    The previous per-stage lookup issued a fresh user_roles/roles query
+    every time. For the current 6-stage workflow (Registration,
     Civil Registrar, Posting Period, Records Division, Assign Registry
     Number, Releasing) that meant up to 6 extra near-simultaneous
     queries on a single GET /api/documents/<id> call — fired at the
@@ -393,12 +334,10 @@ def _get_stage_handler_usernames(permissions):
     document's stages actually needs, in a single query, and returns
     {permission: username} for every permission that currently has
     someone assigned via a Document Tracking role — omitting any
-    permission nobody currently holds, exactly like
-    _get_stage_handler_username() returning None for that case.
+    permission nobody currently holds.
     Selection rules (skip the Administrator role, skip the reserved
     "admin" account, first matching row wins for a given permission)
-    are identical to _get_stage_handler_username() above — this is
-    purely a batching fix, not a behavior change.
+    are unchanged by batching.
     """
     permissions = {p for p in permissions if p}
     if not permissions:
@@ -1074,9 +1013,7 @@ def create_document():
 #    currently holds the permission, the existing document_personnel-
 #    based name (or None -> "Unsigned") is left exactly as it was.
 #
-#    PER-REQUEST QUERY-COUNT FIX (NEW): this used to resolve that
-#    role-based name by calling _get_stage_handler_username() once per
-#    stage (one Supabase query each). That is now done in a single
+#    PER-REQUEST QUERY-COUNT FIX: role-based names are resolved in a single
 #    batched call to _get_stage_handler_usernames() before the loop —
 #    see that function's docstring for why the per-stage version was
 #    causing the detail request to intermittently fail to load right
@@ -1137,9 +1074,8 @@ def get_document_detail(document_id):
         # PER-REQUEST QUERY-COUNT FIX (NEW): resolve every stage's
         # document_stage_* permission up front, then look all of them
         # up in ONE Supabase query via _get_stage_handler_usernames(),
-        # instead of the loop below calling
-        # _get_stage_handler_username() separately for every stage
-        # (which is what used to turn a single document-detail fetch
+        # instead of issuing a separate Supabase query for every stage
+        # (which used to turn a single document-detail fetch
         # into up to 6 extra queries). See that function's docstring
         # for the full reasoning.
         stage_permissions = [_stage_permission_for_label(s.get("label")) for s in stages]

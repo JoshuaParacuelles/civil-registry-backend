@@ -9,7 +9,6 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
-import bcrypt
 from flask import Blueprint, jsonify, request, send_file, session
 from werkzeug.utils import secure_filename
 from pypdf import PdfReader
@@ -599,7 +598,7 @@ def complete_transaction():
         payment_reference = normalize_spaces(data.get("paymentReference", ""))
         payment_amount    = float(data.get("paymentAmount", 0) or 0)
 
-        insert_res = supabase.table("death_transactions").insert({
+        supabase.table("death_transactions").insert({
             "search_operator": search_operator,
             "record_status": record_status,
             "record_id": record_id,
@@ -2391,7 +2390,7 @@ def admin_orphan_files():
 def admin_cleanup_orphans():
     try:
         data = request.get_json(silent=True) or {}
-        orphans, record_count, _ = _find_orphan_files()
+        orphans, _, _ = _find_orphan_files()
 
         if data.get("confirm") is not True:
             return jsonify({

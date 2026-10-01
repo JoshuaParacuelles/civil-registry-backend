@@ -1,4 +1,4 @@
-# security.py  (place in backend/, next to app.py)
+
 """Shared security helpers so every sensitive route is protected the same way."""
 import re
 from functools import wraps
@@ -8,11 +8,6 @@ from flask import jsonify, request, session
 from auth.Rolemanagement import is_admin
 
 
-# Vercel origins nga gitugotan (production + preview deployments):
-#   https://civil-registry-scc.vercel.app                                  (stable domain)
-#   https://civil-registry-<hash>-joshua-paracuelles-projects.vercel.app   (preview / deployment URLs)
-# Ang "-joshua-paracuelles-projects" mao ang team suffix nimo, mao nga ang
-# ubang tawo dili maka-himo og URL nga mo-match ani.
 VERCEL_ORIGIN_PATTERNS = [
     re.compile(r"^https://civil-registry-scc\.vercel\.app$"),
     re.compile(r"^https://civil-registry(-[a-z0-9]+)*-joshua-paracuelles-projects\.vercel\.app$"),
