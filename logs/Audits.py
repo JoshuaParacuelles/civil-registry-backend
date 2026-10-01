@@ -3,7 +3,7 @@ import logging
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from functools import wraps
 
 from flask import Blueprint, g, has_request_context, jsonify, request, session
@@ -19,6 +19,13 @@ _DEDUPE_EVENTS = {}
 _DEDUPE_WINDOW_SECONDS = 300
 _VALID_STATUSES = {"SUCCESS", "FAILED", "DENIED"}
 _SECRET_KEYS = {"password", "token", "secret", "session", "authorization", "cookie", "apikey"}
+# Keys ending in "name" that are NOT personal names and must stay readable.
+_NAME_SAFE_SUFFIXES = (
+    "username", "rolename", "filename", "documentname", "modulename", "resourcename",
+)
+_ROUTE_ID_KEYS = (
+    "record_id", "document_id", "payment_id", "role_id", "handler_id", "id",
+)
 
 
 def init_audit_db():
@@ -70,14 +77,25 @@ def mask_email(value):
 
 def scrub_sensitive(value, key=None):
     """Recursively redact secrets and mask common PII fields in audit details."""
+    # Booleans/None can't hold a secret; keep flags like password_changed=True readable.
+    if value is None or isinstance(value, bool):
+        return value
+
     key_text = re.sub(r"[^a-z0-9]", "", str(key or "").lower())
     if any(secret in key_text for secret in _SECRET_KEYS):
         return "[REDACTED]"
     if any(token in key_text for token in ("birthdate", "dateofbirth", "dateofdeath", "dob")):
         return "[REDACTED]"
+
+    # Recurse first so containers are never stringified by the scalar rules below.
+    if isinstance(value, dict):
+        return {str(k): scrub_sensitive(v, k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_sensitive(item, key) for item in value]
+
     if key_text in {"search", "query", "criteria", "searchcriteria"} and isinstance(value, str):
         return mask_name(value)
-    if "email" in key_text:
+    if "email" in key_text and isinstance(value, str):
         return mask_email(value)
     if key_text == "tin":
         return mask_identifier(value)
@@ -85,15 +103,10 @@ def scrub_sensitive(value, key=None):
         return mask_identifier(value)
     if (
         key_text.endswith("name")
-        and key_text not in {
-            "username", "rolename", "filename", "documentname", "modulename", "resourcename"
-        }
+        and not key_text.endswith(_NAME_SAFE_SUFFIXES)
+        and isinstance(value, str)
     ):
         return mask_name(value)
-    if isinstance(value, dict):
-        return {str(k): scrub_sensitive(v, k) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [scrub_sensitive(item, key) for item in value]
     return value
 
 
@@ -178,15 +191,21 @@ def record_action(
         print(f"[AUDIT RECORD ERROR] {e}", flush=True)
 
 
-def set_audit_context(*, old_value=None, new_value=None, resource_id=None, meta=None):
+def set_audit_context(*, old_value=None, new_value=None, resource_id=None, meta=None, status=None):
     """Attach safe transition details for the current route's audit decorator."""
     if has_request_context():
-        g._audit_context = {
-            "old_value": old_value,
-            "new_value": new_value,
-            "resource_id": resource_id,
-            "meta": meta or {},
-        }
+        context = dict(getattr(g, "_audit_context", {}))
+        if old_value is not None:
+            context["old_value"] = old_value
+        if new_value is not None:
+            context["new_value"] = new_value
+        if resource_id is not None:
+            context["resource_id"] = resource_id
+        if status is not None:
+            context["status"] = str(status).upper()
+        if meta:
+            context["meta"] = {**context.get("meta", {}), **meta}
+        g._audit_context = context
 
 
 def _response_status(result):
@@ -199,88 +218,162 @@ def _response_status(result):
     return getattr(result, "status_code", 200)
 
 
-def audit_action(action, resource_type=None, description=None):
-    """Audit a route response as SUCCESS, FAILED, or DENIED without altering it."""
+def _route_resource_id():
+    route_args = getattr(request, "view_args", None) or {}
+    return next((route_args[k] for k in _ROUTE_ID_KEYS if k in route_args), None)
+
+
+def audit_action(action, resource_type=None, description=None, dedupe_window_seconds=None):
+    """Audit a route response as SUCCESS, FAILED, or DENIED without altering it.
+
+    Dedupe (if requested) applies to SUCCESS events only, so a failed attempt
+    never hides the next successful one. Audit errors never break the request.
+    """
     def decorate(fn):
         @wraps(fn)
         def wrapped(*args, **kwargs):
             try:
                 result = fn(*args, **kwargs)
             except Exception as exc:
-                route_args = getattr(request, "view_args", None) or {}
+                try:
+                    context = getattr(g, "_audit_context", {})
+                    record_action(
+                        action,
+                        description or action.replace("_", " ").title(),
+                        status="FAILED",
+                        resource_type=resource_type,
+                        resource_id=context.get("resource_id", _route_resource_id()),
+                        old_value=context.get("old_value"),
+                        new_value=context.get("new_value"),
+                        meta={
+                            "route": request.path,
+                            "error_type": type(exc).__name__,
+                            **context.get("meta", {}),
+                        },
+                    )
+                except Exception:
+                    _logger.exception("[AUDIT DECORATOR ERROR]")
+                raise
+
+            try:
+                status_code = _response_status(result)
                 context = getattr(g, "_audit_context", {})
-                resource_id = next(
-                    (route_args[key] for key in (
-                        "record_id", "document_id", "payment_id", "role_id", "handler_id", "id"
-                    ) if key in route_args),
-                    None,
+                event_status = context.get("status") or (
+                    "DENIED" if status_code in (401, 403)
+                    else "FAILED" if status_code >= 400
+                    else "SUCCESS"
                 )
+                if (
+                    dedupe_window_seconds
+                    and event_status == "SUCCESS"
+                    and should_dedupe(
+                        action,
+                        user_id=session.get("user_id"),
+                        username=session.get("username"),
+                        window_seconds=dedupe_window_seconds,
+                    )
+                ):
+                    return result
                 record_action(
                     action,
                     description or action.replace("_", " ").title(),
-                    status="FAILED",
+                    status=event_status,
                     resource_type=resource_type,
-                    resource_id=context.get("resource_id", resource_id),
+                    resource_id=context.get("resource_id", _route_resource_id()),
                     old_value=context.get("old_value"),
                     new_value=context.get("new_value"),
                     meta={
                         "route": request.path,
-                        "error_type": type(exc).__name__,
+                        "method": request.method,
                         **context.get("meta", {}),
                     },
                 )
-                raise
-
-            status_code = _response_status(result)
-            event_status = "DENIED" if status_code in (401, 403) else (
-                "FAILED" if status_code >= 400 else "SUCCESS"
-            )
-            route_args = getattr(request, "view_args", None) or {}
-            context = getattr(g, "_audit_context", {})
-            resource_id = next(
-                (route_args[key] for key in (
-                    "record_id", "document_id", "payment_id", "role_id", "handler_id", "id"
-                ) if key in route_args),
-                None,
-            )
-            record_action(
-                action,
-                description or action.replace("_", " ").title(),
-                status=event_status,
-                resource_type=resource_type,
-                resource_id=context.get("resource_id", resource_id),
-                old_value=context.get("old_value"),
-                new_value=context.get("new_value"),
-                meta={
-                    "route": request.path,
-                    "method": request.method,
-                    **context.get("meta", {}),
-                },
-            )
+            except Exception:
+                _logger.exception("[AUDIT DECORATOR ERROR]")
             return result
         return wrapped
     return decorate
 
 
+def _safe_filter(value):
+    """Strip characters that are special in PostgREST filters / ilike patterns.
+
+    Underscore is intentionally kept: it is only a single-char wildcard in
+    ilike, and action names such as BIRTH_RECORD_VIEWED contain it.
+    """
+    return re.sub(r"[(),%*\"'\\]", " ", value).strip()
+
+
+def _parse_iso_date(value, parameter):
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError as exc:
+        raise ValueError(f"{parameter} must be an ISO date (YYYY-MM-DD)") from exc
+
+
 @audit_bp.route("/api/audit/history", methods=["GET"])
 @require_admin
+@audit_action("AUDIT_LOG_VIEWED", resource_type="audit_log", dedupe_window_seconds=300)
 def get_history():
-    limit  = max(1, min(request.args.get("limit", 100, type=int), 1000))
+    limit = max(1, min(request.args.get("limit", 100, type=int), 200))
     offset = max(0, request.args.get("offset", 0, type=int))
     action = request.args.get("action", "").strip()
+    user = request.args.get("user", "").strip()
+    status = request.args.get("status", "").strip().upper()
+    resource_type = request.args.get("resource_type", "").strip()
+    date_from = request.args.get("date_from", "").strip()
+    date_to = request.args.get("date_to", "").strip()
     search = request.args.get("search", "").strip()
+
+    if status and status not in _VALID_STATUSES:
+        return jsonify({"error": "status must be SUCCESS, FAILED, or DENIED"}), 400
+
+    try:
+        start_date = _parse_iso_date(date_from, "date_from")
+        end_date = _parse_iso_date(date_to, "date_to")
+        start_at = (
+            datetime.combine(start_date, datetime_time.min, tzinfo=timezone.utc)
+            if start_date else None
+        )
+        end_before = (
+            datetime.combine(end_date + timedelta(days=1), datetime_time.min, tzinfo=timezone.utc)
+            if end_date else None
+        )
+    except (ValueError, OverflowError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    if start_date and end_date and start_date > end_date:
+        return jsonify({"error": "date_from must not be after date_to"}), 400
 
     try:
         query = supabase.table("audit_logs").select(
-            "id, username, action, description, meta, ip_address, created_at"
+            "id, username, user_id, role, action, description, meta, ip_address, "
+            "status, resource_type, resource_id, old_value, new_value, user_agent, created_at",
+            count="exact",
         )
 
         if action:
             query = query.eq("action", action)
+        if user:
+            query = query.ilike("username", f"%{_safe_filter(user)}%")
+        if status:
+            query = query.eq("status", status)
+        if resource_type:
+            query = query.eq("resource_type", resource_type)
+        if start_at:
+            query = query.gte("created_at", start_at.isoformat())
+        if end_before:
+            query = query.lt("created_at", end_before.isoformat())
         if search:
-            # Commas/parentheses have special meaning inside PostgREST's or_().
-            safe = search.replace(",", " ").replace("(", " ").replace(")", " ")
-            query = query.or_(f"description.ilike.%{safe}%,username.ilike.%{safe}%")
+            safe = _safe_filter(search)
+            if safe:
+                query = query.or_(
+                    f"description.ilike.%{safe}%,username.ilike.%{safe}%,"
+                    f"action.ilike.%{safe}%,resource_type.ilike.%{safe}%,"
+                    f"resource_id.ilike.%{safe}%"
+                )
 
         # Secondary sort on id keeps page boundaries stable when several rows
         # share the same created_at.
@@ -291,11 +384,46 @@ def get_history():
             .execute()
         )
 
-        return jsonify(res.data)
+        return jsonify({
+            "data": res.data or [],
+            "total": res.count or 0,
+            "limit": limit,
+            "offset": offset,
+        })
 
     except Exception as e:
-        print(f"[AUDIT HISTORY ERROR] {e}")
-        return jsonify({"error": str(e)}), 500
+        message = str(e)
+        # Offset past the last row: PostgREST answers 416 / PGRST103.
+        if "PGRST103" in message or "416" in message:
+            return jsonify({"data": [], "total": 0, "limit": limit, "offset": offset})
+        _logger.exception("[AUDIT HISTORY ERROR] %s", e)
+        print(f"[AUDIT HISTORY ERROR] {e}", flush=True)
+        return jsonify({"error": "Failed to load audit history"}), 500
+
+
+@audit_bp.route("/api/audit/export-event", methods=["POST"])
+@require_admin
+def audit_export_event():
+    """Record that an admin exported the audit log (the export itself is client-side)."""
+    body = request.get_json(silent=True) or {}
+    filters = {
+        key: str(body[key])[:100]
+        for key in ("action", "user", "status", "resource_type", "date_from", "date_to")
+        if body.get(key)
+    }
+    row_count = body.get("row_count")
+    meta = {"format": "csv", "filters": filters}
+    if isinstance(row_count, int) and not isinstance(row_count, bool):
+        meta["row_count"] = row_count
+
+    record_action(
+        "AUDIT_LOG_EXPORTED",
+        "Exported audit logs as CSV",
+        status="SUCCESS",
+        resource_type="audit_log",
+        meta=meta,
+    )
+    return "", 204
 
 
 @audit_bp.route("/api/audit/access-denied", methods=["POST"])
@@ -315,7 +443,11 @@ def record_client_access_denied():
     ):
         return jsonify({"error": "A local route path is required"}), 400
 
-    if should_dedupe("ACCESS_DENIED", session.get("user_id"), username):
+    # Drop query string / fragment: they can carry personal data.
+    attempted_route = attempted_route.split("?", 1)[0].split("#", 1)[0]
+
+    # Dedupe per route so denials of different pages are all recorded.
+    if should_dedupe(f"ACCESS_DENIED:{attempted_route}", session.get("user_id"), username):
         return "", 204
 
     role = session.get("role") or (
@@ -336,4 +468,3 @@ def record_client_access_denied():
 
 
 # Audit writes are server-side only; audit history is append-only.
-

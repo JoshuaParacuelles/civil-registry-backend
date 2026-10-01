@@ -16,7 +16,7 @@ from postgrest.exceptions import APIError
 
 from supabase_client import supabase
 from routes.notification import push_notification
-from logs.Audits import record_action
+from logs.Audits import audit_action, record_action, set_audit_context
 from security import login_required_hook, admin_required
 
 
@@ -379,9 +379,11 @@ def parse_death_certificate_from_bytes(pdf_bytes: bytes) -> Dict:
 # =============================================================================
 
 @death_bp.route("/records", methods=["GET"])
+@audit_action("DEATH_RECORDS_LISTED", resource_type="death_record", dedupe_window_seconds=300)
 def get_records():
     res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS) \
         .order("uploaded_at", desc=True).order("id", desc=True).execute()
+    set_audit_context(meta={"search_type": "list", "result_count": len(res.data or [])})
     return jsonify(res.data)
 
 
@@ -392,11 +394,13 @@ DEATH_ARCHIVED_FILTER = "is_archived.eq.true,is_archived.is.null"
 
 
 @death_bp.route("/archived", methods=["GET"])
+@audit_action("DEATH_ARCHIVE_LISTED", resource_type="death_record", dedupe_window_seconds=300)
 def get_archived_records():
     try:
         res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS) \
             .or_(DEATH_ARCHIVED_FILTER) \
             .order("archived_at", desc=True).order("id", desc=True).execute()
+        set_audit_context(meta={"search_type": "list", "result_count": len(res.data or [])})
         return jsonify(res.data)
     except Exception as e:
         import traceback
@@ -405,6 +409,7 @@ def get_archived_records():
 
 
 @death_bp.route("/records", methods=["POST"])
+@audit_action("DEATH_RECORD_UPLOADED", resource_type="death_record")
 def upload_record():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded."}), 400
@@ -423,6 +428,7 @@ def upload_record():
 
     original_file_name = file.filename.strip()
     file_stem          = safe_stem(original_file_name)
+    set_audit_context(meta={"file_name": original_file_name, "file_type": "pdf"})
 
     try:
         parsed       = parse_death_certificate_from_bytes(file_bytes)
@@ -450,6 +456,10 @@ def upload_record():
             return jsonify({"error": "Failed to insert record."}), 500
 
         record_id = res.data[0]["id"]
+        set_audit_context(
+            resource_id=record_id,
+            meta={"file_name": original_file_name, "file_type": "pdf"},
+        )
 
         fetch_res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS).eq("id", record_id).single().execute()
         return jsonify(fetch_res.data), 201
@@ -459,6 +469,7 @@ def upload_record():
 
 
 @death_bp.route("/records/<int:record_id>", methods=["GET"])
+@audit_action("DEATH_RECORD_VIEWED", resource_type="death_record")
 def get_record_pdf(record_id: int):
     res = supabase.table("death_records").select("*").eq("id", record_id).limit(1).execute()
 
@@ -476,6 +487,7 @@ def get_record_pdf(record_id: int):
 
 
 @death_bp.route("/records/<int:record_id>/download", methods=["GET"])
+@audit_action("DEATH_RECORD_DOWNLOADED", resource_type="death_record")
 def download_record_pdf(record_id: int):
     res = supabase.table("death_records").select("original_file_name, pdf_file, pdf_mime_type").eq("id", record_id).limit(1).execute()
 
@@ -498,6 +510,7 @@ def download_record_pdf(record_id: int):
 
 
 @death_bp.route("/records/<int:record_id>/archive", methods=["PUT", "POST"])
+@audit_action("DEATH_RECORD_ARCHIVED", resource_type="death_record")
 def archive_record(record_id: int):
     try:
         current_time = now_dt().isoformat()
@@ -510,14 +523,12 @@ def archive_record(record_id: int):
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
 
-        # Audit trail: every archive action is logged.
         archived_row = res.data[0] if res.data else {}
-        record_action(
-            "ARCHIVE",
-            f"Archived death record: '{archived_row.get('file_name', record_id)}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": archived_row.get("file_name")},
-            ip=request.remote_addr
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": False},
+            new_value={"is_archived": True},
+            meta={"file_name": archived_row.get("file_name")},
         )
 
         return jsonify({"success": True, "message": "Record archived successfully."}), 200
@@ -526,6 +537,7 @@ def archive_record(record_id: int):
 
 
 @death_bp.route("/records/<int:record_id>/restore", methods=["PUT", "POST"])
+@audit_action("DEATH_RECORD_RESTORED", resource_type="death_record")
 def restore_record(record_id: int):
     try:
         current_time = now_dt().isoformat()
@@ -538,14 +550,12 @@ def restore_record(record_id: int):
         if not res.data:
             return jsonify({"error": "Archived record not found."}), 404
 
-        # Audit trail: every restore action is logged.
         restored_row = res.data[0] if res.data else {}
-        record_action(
-            "RESTORE",
-            f"Restored death record: '{restored_row.get('file_name', record_id)}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": restored_row.get("file_name")},
-            ip=request.remote_addr
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": True},
+            new_value={"is_archived": False},
+            meta={"file_name": restored_row.get("file_name")},
         )
 
         return jsonify({"success": True, "message": "Record restored successfully."}), 200
@@ -554,8 +564,20 @@ def restore_record(record_id: int):
 
 
 @death_bp.route("/records/<int:record_id>", methods=["DELETE"])
+@audit_action("DEATH_RECORD_DELETED", resource_type="death_record")
 def delete_record(record_id: int):
     try:
+        existing = supabase.table("death_records").select(
+            "file_name, is_archived"
+        ).eq("id", record_id).limit(1).execute().data
+        if not existing:
+            return jsonify({"error": "Record not found."}), 404
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": existing[0].get("is_archived")},
+            new_value=None,
+            meta={"file_name": existing[0].get("file_name")},
+        )
         res = supabase.table("death_records").delete().eq("id", record_id).execute()
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
@@ -565,6 +587,7 @@ def delete_record(record_id: int):
 
 
 @death_bp.route("/records/complete", methods=["POST"])
+@audit_action("DEATH_TRANSACTION_COMPLETED", resource_type="death_transaction")
 def complete_transaction():
     data = request.get_json(silent=True) or {}
 
@@ -597,6 +620,14 @@ def complete_transaction():
         search_operator   = normalize_spaces(data.get("searchOperator", ""))
         payment_reference = normalize_spaces(data.get("paymentReference", ""))
         payment_amount    = float(data.get("paymentAmount", 0) or 0)
+        set_audit_context(
+            resource_id=record_id,
+            meta={
+                "record_status": record_status,
+                "payment_amount": payment_amount,
+                "payment_method": normalize_spaces(data.get("paymentMethod", "")),
+            },
+        )
 
         supabase.table("death_transactions").insert({
             "search_operator": search_operator,
@@ -649,6 +680,7 @@ def _normalize_payment_status(record_status: str) -> str:
 
 
 @death_bp.route("/payments", methods=["GET"])
+@audit_action("DEATH_PAYMENTS_VIEWED", resource_type="death_transaction", dedupe_window_seconds=300)
 def get_payments():
     limit_param = request.args.get("limit")
 
@@ -683,6 +715,10 @@ def get_payments():
         item["last_name"]     = item.get("last_name")   or ""
         payments.append(item)
 
+    set_audit_context(meta={"result_count": len(payments), "total_count": total_requests})
+
+    set_audit_context(meta={"result_count": len(payments)})
+
     return jsonify({
         "payments":       payments,
         "total_requests": total_requests,
@@ -691,10 +727,12 @@ def get_payments():
 
 
 @death_bp.route("/stats", methods=["GET"])
+@audit_action("DEATH_PAYMENT_STATS_VIEWED", resource_type="death_transaction", dedupe_window_seconds=300)
 def get_stats():
     res = supabase.table("death_transactions").select("payment_amount").execute()
     total_requests = len(res.data)
     total_payments = sum(float(r.get("payment_amount") or 0) for r in res.data)
+    set_audit_context(meta={"result_count": total_requests})
     return jsonify({
         "total_requests": total_requests,
         "total_payments": total_payments,
@@ -1051,6 +1089,7 @@ ARCHIVED_FIELDS = LIST_FIELDS.replace("updated_at", "archived_at")
 
 
 @birth_bp.route('/api/birth/records', methods=['GET'])
+@audit_action("BIRTH_RECORDS_SEARCHED", resource_type="birth_record", dedupe_window_seconds=300)
 def get_records():
     try:
         search = request.args.get('search', '').strip()
@@ -1066,6 +1105,10 @@ def get_records():
         # Archive tab (see BIRTH_ARCHIVED_FILTER).
         q = q.eq("is_archived", _bool_filter(False))
         rows = q.order("uploaded_at", desc=True).execute().data or []
+        set_audit_context(meta={
+            "search_type": "name" if search else "list",
+            "result_count": len(rows),
+        })
 
         return jsonify([_serialize_record_no_pdf(r) for r in rows])
 
@@ -1078,6 +1121,7 @@ def get_records():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/archived', methods=['GET'])
+@audit_action("BIRTH_ARCHIVE_SEARCHED", resource_type="birth_record", dedupe_window_seconds=300)
 def get_archived_records():
     try:
         search = request.args.get('search', '').strip()
@@ -1092,6 +1136,10 @@ def get_archived_records():
         # is_archived = TRUE or NULL (see BIRTH_ARCHIVED_FILTER).
         q = q.or_(BIRTH_ARCHIVED_FILTER)
         rows = q.order("archived_at", desc=True).execute().data or []
+        set_audit_context(meta={
+            "search_type": "name" if search else "list",
+            "result_count": len(rows),
+        })
 
         return jsonify([_serialize_record_no_pdf(r) for r in rows])
 
@@ -1104,6 +1152,7 @@ def get_archived_records():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/records', methods=['POST'])
+@audit_action("BIRTH_RECORD_UPLOADED", resource_type="birth_record")
 def upload_record():
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -1121,6 +1170,7 @@ def upload_record():
             return jsonify({"error": "Uploaded file does not appear to be a valid PDF."}), 400
 
         file_name = os.path.splitext(secure_filename(file.filename))[0]
+        set_audit_context(meta={"file_name": f"{file_name}.pdf", "file_type": "pdf"})
 
         file_size_bytes = len(pdf_bytes)
         file_size_kb    = round(file_size_bytes / 1024, 2)
@@ -1192,24 +1242,17 @@ def upload_record():
             raise
 
         record_id = resp.data[0]["id"] if resp.data else None
+        set_audit_context(
+            resource_id=record_id,
+            meta={
+                "file_name": f"{file_name}.pdf",
+                "file_type": "pdf",
+                "extraction_status": extracted["extraction_status"],
+            },
+        )
 
         # No notification on upload — notifications fire only when a
         # matching record is found and a transaction is completed.
-
-        record_action(
-            "UPLOAD",
-            f"Uploaded birth record to archive: '{file_name}'",
-            username=get_user(),
-            meta={
-                "file_name": file_name,
-                "record_id": record_id,
-                "child_full_name":   extracted["child_full_name"],
-                "mother_full_name":  extracted["mother_full_name"],
-                "father_full_name":  extracted["father_full_name"],
-                "extraction_status": extracted["extraction_status"]
-            },
-            ip=request.remote_addr
-        )
 
         return jsonify({
             "message": "Record uploaded to archive successfully",
@@ -1240,6 +1283,7 @@ def upload_record():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/records/<int:record_id>/relatives', methods=['PATCH'])
+@audit_action("BIRTH_RELATIVES_UPDATED", resource_type="birth_record")
 def update_relatives(record_id):
     try:
         data = request.get_json() or {}
@@ -1254,10 +1298,29 @@ def update_relatives(record_id):
         father_full_name = _build_full_name(father_first_name, father_middle_name, father_last_name)
         mother_full_name = _build_full_name(mother_first_name, mother_middle_name, mother_last_name)
 
-        existing = supabase.table("birth_records").select("id, file_name").eq("id", record_id).limit(1).execute().data
+        existing = supabase.table("birth_records").select(
+            "id, file_name, father_first_name, father_middle_name, father_last_name, "
+            "mother_first_name, mother_middle_name, mother_last_name"
+        ).eq("id", record_id).limit(1).execute().data
         if not existing:
             return jsonify({"error": "Record not found"}), 404
         record = existing[0]
+        set_audit_context(
+            resource_id=record_id,
+            old_value={key: record.get(key) for key in (
+                "father_first_name", "father_middle_name", "father_last_name",
+                "mother_first_name", "mother_middle_name", "mother_last_name",
+            )},
+            new_value={
+                "father_first_name": father_first_name,
+                "father_middle_name": father_middle_name,
+                "father_last_name": father_last_name,
+                "mother_first_name": mother_first_name,
+                "mother_middle_name": mother_middle_name,
+                "mother_last_name": mother_last_name,
+            },
+            meta={"file_name": record.get("file_name")},
+        )
 
         supabase.table("birth_records").update({
             "father_first_name": father_first_name, "father_middle_name": father_middle_name,
@@ -1266,19 +1329,6 @@ def update_relatives(record_id):
             "mother_last_name": mother_last_name, "mother_full_name": mother_full_name,
             "updated_at": datetime.now().isoformat(),
         }).eq("id", record_id).execute()
-
-        record_action(
-            "UPDATE_RELATIVES",
-            f"Updated relatives for birth record: '{record['file_name']}'",
-            username=get_user(),
-            meta={
-                "record_id": record_id,
-                "file_name": record["file_name"],
-                "father_full_name": father_full_name,
-                "mother_full_name": mother_full_name
-            },
-            ip=request.remote_addr
-        )
 
         return jsonify({
             "message": "Relatives updated successfully",
@@ -1298,6 +1348,7 @@ def update_relatives(record_id):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/records/complete', methods=['POST'])
+@audit_action("BIRTH_TRANSACTION_COMPLETED", resource_type="birth_payment")
 def complete_transaction():
     try:
         data = request.get_json() or {}
@@ -1316,6 +1367,15 @@ def complete_transaction():
         payment_status    = 'positive' if record_status == 'ACTIVE' else 'negative'
         payment_date      = now_ph()
         processed_by      = get_user()
+        set_audit_context(
+            resource_id=record_id,
+            meta={
+                "record_status": record_status,
+                "payment_status": payment_status,
+                "payment_amount": payment_amount,
+                "payment_method": payment_method,
+            },
+        )
 
         resp = supabase.table("birth_payments").insert({
             "first_name": first_name, "last_name": last_name,
@@ -1348,20 +1408,7 @@ def complete_transaction():
                 message=f"Birth certificate issued for '{subject}'",
             )
 
-        record_action(
-            "TRANSACTION_COMPLETE",
-            f"Transaction completed for '{search_operator}' — {payment_status.upper()}",
-            username=processed_by,
-            meta={
-                "payment_id": payment_id,
-                "record_status": record_status,
-                "birth_record_id": record_id,
-                "payment_amount": payment_amount,
-                "payment_method": payment_method,
-                "payment_reference": payment_reference,
-            },
-            ip=request.remote_addr
-        )
+        set_audit_context(resource_id=payment_id)
 
         return jsonify({
             "message": "Transaction completed successfully",
@@ -1381,6 +1428,7 @@ def complete_transaction():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/records/<int:record_id>', methods=['GET'])
+@audit_action("BIRTH_RECORD_VIEWED", resource_type="birth_record")
 def get_record(record_id):
     try:
         rows = supabase.table("birth_records").select("*").eq("id", record_id).limit(1).execute().data
@@ -1388,13 +1436,7 @@ def get_record(record_id):
             return jsonify({"error": "Record not found"}), 404
         record = rows[0]
 
-        record_action(
-            "VIEW",
-            f"Viewed birth record: '{record['file_name']}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": record['file_name']},
-            ip=request.remote_addr
-        )
+        set_audit_context(resource_id=record_id, meta={"file_name": record.get("file_name")})
 
         if record.get('pdf_data') is None:
             return jsonify({"error": "No PDF data found for this record."}), 404
@@ -1414,6 +1456,7 @@ def get_record(record_id):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/records/<int:record_id>/view', methods=['GET'])
+@audit_action("BIRTH_RECORD_PDF_VIEWED", resource_type="birth_record")
 def view_record_pdf(record_id):
     try:
         rows = supabase.table("birth_records").select(
@@ -1429,13 +1472,7 @@ def view_record_pdf(record_id):
             status = 404 if "No PDF data" in str(ve) else 500
             return jsonify({"error": str(ve)}), status
 
-        record_action(
-            "VIEW",
-            f"Previewed birth record PDF: '{record['file_name']}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": record['file_name']},
-            ip=request.remote_addr
-        )
+        set_audit_context(resource_id=record_id, meta={"file_name": record.get("file_name"), "file_type": "pdf"})
 
         pdf_io = io.BytesIO(pdf_bytes)
         pdf_io.seek(0)
@@ -1452,6 +1489,7 @@ def view_record_pdf(record_id):
 
 
 @birth_bp.route('/api/birth/records/<int:record_id>/download', methods=['GET'])
+@audit_action("BIRTH_RECORD_DOWNLOADED", resource_type="birth_record")
 def download_record(record_id):
     try:
         rows = supabase.table("birth_records").select("file_name, pdf_data").eq("id", record_id).limit(1).execute().data
@@ -1459,13 +1497,7 @@ def download_record(record_id):
             return jsonify({"error": "Record not found"}), 404
         record = rows[0]
 
-        record_action(
-            "DOWNLOAD",
-            f"Downloaded birth record: '{record['file_name']}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": record['file_name']},
-            ip=request.remote_addr
-        )
+        set_audit_context(resource_id=record_id, meta={"file_name": record.get("file_name"), "file_type": "pdf"})
 
         try:
             pdf_bytes = _decode_pdf_data(record.get('pdf_data'))
@@ -1491,12 +1523,19 @@ def download_record(record_id):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/records/<int:record_id>/archive', methods=['POST'])
+@audit_action("BIRTH_RECORD_ARCHIVED", resource_type="birth_record")
 def archive_record(record_id):
     try:
         rows = supabase.table("birth_records").select("id, file_name, is_archived").eq("id", record_id).limit(1).execute().data
         if not rows:
             return jsonify({"error": "Record not found"}), 404
         record = rows[0]
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": record.get("is_archived")},
+            new_value={"is_archived": True},
+            meta={"file_name": record.get("file_name")},
+        )
 
         if record['is_archived']:
             return jsonify({"error": "Record is already archived"}), 400
@@ -1506,14 +1545,6 @@ def archive_record(record_id):
             {"is_archived": True, "archived_at": datetime.now().isoformat()}
         ).eq("id", record_id).execute()
 
-        record_action(
-            "ARCHIVE",
-            f"Archived birth record: '{record['file_name']}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": record['file_name']},
-            ip=request.remote_addr
-        )
-
         return jsonify({"message": "Record archived successfully"})
 
     except Exception as e:
@@ -1521,12 +1552,19 @@ def archive_record(record_id):
 
 
 @birth_bp.route('/api/birth/records/<int:record_id>/restore', methods=['POST'])
+@audit_action("BIRTH_RECORD_RESTORED", resource_type="birth_record")
 def restore_record(record_id):
     try:
         rows = supabase.table("birth_records").select("id, file_name, is_archived").eq("id", record_id).limit(1).execute().data
         if not rows:
             return jsonify({"error": "Record not found"}), 404
         record = rows[0]
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": record.get("is_archived")},
+            new_value={"is_archived": False},
+            meta={"file_name": record.get("file_name")},
+        )
 
         if not record['is_archived']:
             return jsonify({"error": "Record is not archived"}), 400
@@ -1535,14 +1573,6 @@ def restore_record(record_id):
             {"is_archived": False, "archived_at": None}
         ).eq("id", record_id).execute()
 
-        record_action(
-            "RESTORE",
-            f"Restored birth record: '{record['file_name']}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": record['file_name']},
-            ip=request.remote_addr
-        )
-
         return jsonify({"message": "Record restored successfully"})
 
     except Exception as e:
@@ -1550,22 +1580,20 @@ def restore_record(record_id):
 
 
 @birth_bp.route('/api/birth/records/<int:record_id>', methods=['DELETE'])
+@audit_action("BIRTH_RECORD_DELETED", resource_type="birth_record")
 def delete_record(record_id):
     try:
         rows = supabase.table("birth_records").select("file_name").eq("id", record_id).limit(1).execute().data
         if not rows:
             return jsonify({"error": "Record not found"}), 404
         file_name = rows[0]['file_name']
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"file_name": file_name},
+            new_value=None,
+        )
 
         supabase.table("birth_records").delete().eq("id", record_id).execute()
-
-        record_action(
-            "DELETE",
-            f"Permanently deleted birth record: '{file_name}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": file_name},
-            ip=request.remote_addr
-        )
 
         return jsonify({"message": "Record deleted successfully"})
 
@@ -1578,11 +1606,13 @@ def delete_record(record_id):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/verify', methods=['POST'])
+@audit_action("BIRTH_RECORD_VERIFIED", resource_type="birth_record", dedupe_window_seconds=300)
 def verify_record():
     try:
         data = request.get_json() or {}
         first_name = data.get('firstName', '').strip()
         last_name  = data.get('lastName', '').strip()
+        set_audit_context(meta={"search_type": "name"})
 
         if not first_name or not last_name:
             return jsonify({"error": "First name and last name are required"}), 400
@@ -1598,28 +1628,20 @@ def verify_record():
         ).order("uploaded_at", desc=True).limit(1).execute().data
 
         record = rows[0] if rows else None
+        set_audit_context(
+            resource_id=record.get("id") if record else None,
+            status="SUCCESS" if record else "FAILED",
+            meta={"search_type": "name", "result_count": 1 if record else 0,
+                  "result": "FOUND" if record else "NOT_FOUND"},
+        )
 
         if record:
-            record_action(
-                "SEARCH",
-                f"Birth record verify — FOUND: '{first_name} {last_name}'",
-                username=get_user(),
-                meta={"search": f"{first_name} {last_name}", "result": "ACTIVE"},
-                ip=request.remote_addr
-            )
             return jsonify({
                 "found": True,
                 "status": "ACTIVE",
                 "record": _serialize_record_no_pdf(record)
             })
 
-        record_action(
-            "SEARCH",
-            f"Birth record verify — NOT FOUND: '{first_name} {last_name}'",
-            username=get_user(),
-            meta={"search": f"{first_name} {last_name}", "result": "NOT_FOUND"},
-            ip=request.remote_addr
-        )
         return jsonify({
             "found": False,
             "status": "NOT_FOUND",
@@ -1635,6 +1657,7 @@ def verify_record():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/payments', methods=['POST'])
+@audit_action("BIRTH_PAYMENT_CREATED", resource_type="birth_payment")
 def create_payment():
     try:
         data = request.get_json()
@@ -1659,6 +1682,11 @@ def create_payment():
         document_issued   = data.get('document_issued', '').strip() or None
         payment_date      = now_ph()
         processed_by      = get_user()
+        set_audit_context(
+            resource_id=birth_record_id,
+            meta={"payment_status": payment_status, "amount": amount,
+                  "payment_method": payment_method},
+        )
 
         if payment_status == 'positive' and birth_record_id is not None:
             exists = supabase.table("birth_records").select("id").eq("id", birth_record_id).limit(1).execute().data
@@ -1687,21 +1715,7 @@ def create_payment():
                 message=f"Birth certificate issued for '{first_name} {last_name}'",
             )
 
-        record_action(
-            "PAYMENT",
-            f"Payment recorded for '{first_name} {last_name}' — status: {payment_status.upper()}",
-            username=processed_by,
-            meta={
-                "payment_id": payment_id,
-                "first_name": first_name,
-                "last_name": last_name,
-                "payment_status": payment_status,
-                "amount": amount,
-                "payment_reference": payment_reference,
-                "birth_record_id": birth_record_id,
-            },
-            ip=request.remote_addr
-        )
+        set_audit_context(resource_id=payment_id)
 
         return jsonify({
             "message": "Payment recorded successfully",
@@ -1723,6 +1737,7 @@ def create_payment():
 
 
 @birth_bp.route('/api/birth/payments', methods=['GET'])
+@audit_action("BIRTH_PAYMENTS_VIEWED", resource_type="birth_payment", dedupe_window_seconds=300)
 def get_payments():
     try:
         search = request.args.get('search', '').strip()
@@ -1745,6 +1760,7 @@ def get_payments():
         resp = q.order("payment_date", desc=True).range(offset, offset + limit - 1).execute()
         payments = resp.data or []
         total    = resp.count or 0
+        set_audit_context(meta={"result_count": len(payments), "total_count": total})
 
         return jsonify({"total": total, "payments": payments})
 
@@ -1753,6 +1769,7 @@ def get_payments():
 
 
 @birth_bp.route('/api/birth/payments/<int:payment_id>', methods=['GET'])
+@audit_action("BIRTH_PAYMENT_VIEWED", resource_type="birth_payment")
 def get_payment(payment_id):
     try:
         rows = supabase.table("birth_payments").select("*").eq("id", payment_id).limit(1).execute().data
@@ -1854,6 +1871,17 @@ def _safe_remove(path, retries=5, delay=0.2):
                 return False
             time.sleep(delay)
     return not os.path.exists(path)
+
+
+def _audit_marriage_file_move_failure(record_id, operation, error):
+    record_action(
+        "MARRIAGE_FILE_MOVE_FAILED",
+        f"Failed to move marriage PDF during {operation}",
+        status="FAILED",
+        resource_type="marriage_record",
+        resource_id=record_id,
+        meta={"file_type": "pdf", "operation": operation, "error_type": type(error).__name__},
+    )
 
 
 def _all_marriage_rows(columns):
@@ -2242,8 +2270,28 @@ def _repair_row(record_id, real_path, row=None):
             "file_path": real_path,
             "updated_at": datetime.now().isoformat(),
         }).eq("id", record_id).execute()
-    except Exception:
-        pass
+        record_action(
+            "MARRIAGE_FILE_PATH_REPAIRED",
+            "Repaired stored marriage PDF path",
+            status="SUCCESS",
+            resource_type="marriage_record",
+            resource_id=record_id,
+            old_value={
+                "stored_file_name": os.path.basename((row or {}).get("stored_file_name") or ""),
+                "path_present": bool((row or {}).get("file_path")),
+            },
+            new_value={"stored_file_name": real_name, "path_present": True},
+            meta={"file_type": "pdf"},
+        )
+    except Exception as exc:
+        record_action(
+            "MARRIAGE_FILE_PATH_REPAIR_FAILED",
+            "Failed to repair stored marriage PDF path",
+            status="FAILED",
+            resource_type="marriage_record",
+            resource_id=record_id,
+            meta={"file_type": "pdf", "error_type": type(exc).__name__},
+        )
 
 
 def _paths_for_row(row):
@@ -2267,6 +2315,7 @@ def _paths_for_row(row):
 
 @marriage_bp.route("/admin/repair-paths", methods=["POST"])
 @admin_required
+@audit_action("MARRIAGE_PATHS_REPAIRED", resource_type="marriage_record")
 def admin_repair_paths():
     try:
         res  = supabase.table("marriage_records").select(
@@ -2291,6 +2340,11 @@ def admin_repair_paths():
             else:
                 unresolved.append({"id": row["id"], "stored_file_name": stored})
 
+        set_audit_context(
+            old_value={"unresolved_count": len(unresolved)},
+            new_value={"repaired_count": len(repaired)},
+            meta={"repaired_count": len(repaired), "unresolved_count": len(unresolved)},
+        )
         return jsonify({"success": True, "repaired": len(repaired), "unresolved": len(unresolved),
                         "details": {"repaired": repaired, "unresolved": unresolved}}), 200
     except Exception as e:
@@ -2299,6 +2353,7 @@ def admin_repair_paths():
 
 @marriage_bp.route("/admin/debug-paths", methods=["GET"])
 @admin_required
+@audit_action("MARRIAGE_PATHS_DEBUG_VIEWED", resource_type="marriage_file")
 def admin_debug_paths():
     files_active  = os.listdir(UPLOAD_DIR)[:50]         if os.path.isdir(UPLOAD_DIR)         else []
     files_archive = os.listdir(ARCHIVE_UPLOAD_DIR)[:50] if os.path.isdir(ARCHIVE_UPLOAD_DIR) else []
@@ -2371,9 +2426,15 @@ def _find_orphan_files():
 
 @marriage_bp.route("/admin/orphan-files", methods=["GET"])
 @admin_required
+@audit_action("MARRIAGE_ORPHANS_SCANNED", resource_type="marriage_file")
 def admin_orphan_files():
     try:
         orphans, record_count, referenced_count = _find_orphan_files()
+        set_audit_context(meta={
+            "orphan_count": len(orphans),
+            "record_count": record_count,
+            "referenced_count": referenced_count,
+        })
         return jsonify({
             "records_in_database": record_count,
             "files_referenced":    referenced_count,
@@ -2387,12 +2448,14 @@ def admin_orphan_files():
 
 @marriage_bp.route("/admin/cleanup-orphans", methods=["POST"])
 @admin_required
+@audit_action("MARRIAGE_ORPHAN_CLEANUP", resource_type="marriage_file")
 def admin_cleanup_orphans():
     try:
         data = request.get_json(silent=True) or {}
         orphans, _, _ = _find_orphan_files()
 
         if data.get("confirm") is not True:
+            set_audit_context(meta={"confirmed": False, "orphan_count": len(orphans)})
             return jsonify({
                 "deleted": 0,
                 "orphan_count": len(orphans),
@@ -2406,13 +2469,11 @@ def admin_cleanup_orphans():
             else:
                 failed.append(f'{o["folder"]}/{o["file"]}')
 
-        record_action(
-            "CLEANUP",
-            f"Removed {len(deleted)} orphaned marriage PDF file(s)",
-            username=get_user(),
-            meta={"deleted": len(deleted), "failed": len(failed)},
-            ip=request.remote_addr
-        )
+        set_audit_context(meta={
+            "confirmed": True,
+            "deleted_count": len(deleted),
+            "failed_count": len(failed),
+        })
 
         return jsonify({
             "success": True,
@@ -2427,6 +2488,7 @@ def admin_cleanup_orphans():
 # One-off backfill for rows whose is_archived was left NULL.
 @marriage_bp.route("/admin/backfill-is-archived", methods=["POST"])
 @admin_required
+@audit_action("MARRIAGE_ARCHIVE_FLAGS_BACKFILLED", resource_type="marriage_record")
 def admin_backfill_is_archived():
     try:
         res = supabase.table("marriage_records") \
@@ -2434,6 +2496,11 @@ def admin_backfill_is_archived():
             .is_("is_archived", "null") \
             .execute()
         ids = [r["id"] for r in (res.data or [])]
+        set_audit_context(
+            old_value={"is_archived": None, "null_record_count": len(ids)},
+            new_value={"is_archived": False, "updated_count": len(ids)},
+            resource_id="multiple" if ids else None,
+        )
         if not ids:
             return jsonify({"success": True, "updated": 0}), 200
 
@@ -2451,6 +2518,7 @@ def admin_backfill_is_archived():
 # Read-only diagnostic: the actual is_archived value stored per record.
 @marriage_bp.route("/admin/is-archived-status", methods=["GET"])
 @admin_required
+@audit_action("MARRIAGE_ARCHIVE_STATUS_VIEWED", resource_type="marriage_record")
 def admin_is_archived_status():
     try:
         res = supabase.table("marriage_records").select(
@@ -2477,6 +2545,7 @@ def admin_is_archived_status():
 # Body: { "ids": [26, 27, 28], "archived": true }
 @marriage_bp.route("/admin/set-archived", methods=["POST"])
 @admin_required
+@audit_action("MARRIAGE_ARCHIVE_FLAGS_UPDATED", resource_type="marriage_record")
 def admin_set_archived():
     try:
         data = request.get_json(force=True) or {}
@@ -2494,6 +2563,9 @@ def admin_set_archived():
             return jsonify({"error": "'ids' must all be integers."}), 400
 
         now_iso = datetime.now().isoformat()
+        previous = supabase.table("marriage_records").select(
+            "id, is_archived"
+        ).in_("id", ids).execute().data or []
         update_payload = {
             "is_archived": archived,
             "updated_at": now_iso,
@@ -2508,6 +2580,13 @@ def admin_set_archived():
                 updated.append(rid)
             else:
                 missing.append(rid)
+
+        set_audit_context(
+            old_value={str(row["id"]): row.get("is_archived") for row in previous},
+            new_value={"is_archived": archived, "updated_ids": updated},
+            resource_id="multiple",
+            meta={"not_found_ids": missing},
+        )
 
         return jsonify({
             "success": True,
@@ -2524,6 +2603,7 @@ def admin_set_archived():
 # =============================================================================
 
 @marriage_bp.route("/records", methods=["GET"])
+@audit_action("MARRIAGE_RECORDS_LISTED", resource_type="marriage_record", dedupe_window_seconds=300)
 def get_records():
     try:
         # Strict eq(false) so a record can never appear in both the Active
@@ -2531,6 +2611,7 @@ def get_records():
         res = supabase.table("marriage_records").select(MARRIAGE_RECORD_SELECT_COLS) \
             .eq("is_archived", _bool_filter(False)) \
             .order("uploaded_at", desc=True).order("id", desc=True).execute()
+        set_audit_context(meta={"search_type": "list", "result_count": len(res.data or [])})
         return jsonify([row_to_frontend(r) for r in res.data]), 200
     except Exception as e:
         import traceback
@@ -2549,6 +2630,7 @@ def _or_escape(v: str) -> str:
 
 
 @marriage_bp.route("/archived", methods=["GET"])
+@audit_action("MARRIAGE_ARCHIVE_SEARCHED", resource_type="marriage_record", dedupe_window_seconds=300)
 def get_archived_records():
     try:
         search = request.args.get("search",     "").strip()
@@ -2575,6 +2657,10 @@ def get_archived_records():
             query = query.or_(f"groom_last_name.ilike.%{l}%,bride_last_name.ilike.%{l}%")
 
         res = query.order("archived_at", desc=True).order("id", desc=True).execute()
+        set_audit_context(meta={
+            "search_type": "criteria" if (search or fname or lname) else "list",
+            "result_count": len(res.data or []),
+        })
         return jsonify([row_to_frontend(r) for r in res.data]), 200
     except Exception as e:
         import traceback
@@ -2587,16 +2673,19 @@ def get_archived_records():
 # =============================================================================
 
 @marriage_bp.route("/archived", methods=["POST"])
+@audit_action("MARRIAGE_RECORD_UPLOADED", resource_type="marriage_record")
 def upload_archived_shortcut():
     return _upload_pdf(target="archive")
 
 
 @marriage_bp.route("/archived/upload", methods=["POST"])
+@audit_action("MARRIAGE_RECORD_UPLOADED", resource_type="marriage_record")
 def upload_to_archive():
     return _upload_pdf(target="archive")
 
 
 @marriage_bp.route("/records", methods=["POST"])
+@audit_action("MARRIAGE_RECORD_UPLOADED", resource_type="marriage_record")
 def upload_record():
     return _upload_pdf(target="archive")
 
@@ -2606,16 +2695,19 @@ def upload_record():
 # =============================================================================
 
 @marriage_bp.route("/archived/<int:record_id>/view", methods=["GET"])
+@audit_action("MARRIAGE_RECORD_PDF_VIEWED", resource_type="marriage_record")
 def view_archived(record_id):
     return _serve_pdf(record_id, as_attachment=False)
 
 
 @marriage_bp.route("/archived/<int:record_id>/download", methods=["GET"])
+@audit_action("MARRIAGE_RECORD_DOWNLOADED", resource_type="marriage_record")
 def download_archived(record_id):
     return _serve_pdf(record_id, as_attachment=True)
 
 
 @marriage_bp.route("/archived/<int:record_id>", methods=["DELETE"])
+@audit_action("MARRIAGE_RECORD_DELETED", resource_type="marriage_record")
 def delete_archived(record_id):
     return _delete_record(record_id)
 
@@ -2635,6 +2727,10 @@ def _serve_pdf(record_id, as_attachment=False):
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
         row = res.data[0]
+        set_audit_context(
+            resource_id=record_id,
+            meta={"file_name": row.get("original_file_name"), "file_type": "pdf"},
+        )
 
         is_archived  = bool(row.get("is_archived") or False)
         primary_dir  = ARCHIVE_UPLOAD_DIR if is_archived else UPLOAD_DIR
@@ -2673,20 +2769,28 @@ def _delete_record(record_id):
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
         row = res.data[0]
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": row.get("is_archived"), "file_name": row.get("file_name")},
+            new_value=None,
+            meta={"file_type": "pdf"},
+        )
 
         paths = _paths_for_row(row)
         supabase.table("marriage_records").delete().eq("id", record_id).execute()
 
         leftover = [os.path.basename(p) for p in paths if not _safe_remove(p)]
+        if leftover:
+            record_action(
+                "MARRIAGE_FILE_DELETE_FAILED",
+                "Marriage record deleted but associated PDF removal failed",
+                status="FAILED",
+                resource_type="marriage_record",
+                resource_id=record_id,
+                meta={"file_type": "pdf", "leftover_file_count": len(leftover)},
+            )
 
-        record_action(
-            "DELETE",
-            f"Permanently deleted marriage record: '{row.get('file_name', record_id)}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": row.get("file_name"),
-                  "files_left_on_disk": leftover},
-            ip=request.remote_addr
-        )
+        set_audit_context(meta={"file_type": "pdf", "files_left_on_disk": len(leftover)})
 
         payload = {"success": True, "message": "Record deleted successfully."}
         if leftover:
@@ -2724,6 +2828,7 @@ def _upload_pdf(target="archive"):
         file_hash          = compute_file_hash(file)
         original_file_name = normalize_filename(file.filename)
         file_name          = os.path.splitext(original_file_name)[0]
+        set_audit_context(meta={"file_name": original_file_name, "file_type": "pdf"})
         stored_file_name   = f"{uuid.uuid4().hex}_{original_file_name}"
         file_path          = os.path.join(dest_dir, stored_file_name)
 
@@ -2761,6 +2866,10 @@ def _upload_pdf(target="archive"):
 
         tmp_path = None
         new_row  = res.data[0]
+        set_audit_context(
+            resource_id=new_row.get("id"),
+            meta={"file_name": original_file_name, "file_type": "pdf"},
+        )
 
         # No notification on upload — notifications fire only when a
         # matching record is found and a certificate is issued.
@@ -2792,6 +2901,7 @@ def _upload_pdf(target="archive"):
 # =============================================================================
 
 @marriage_bp.route("/records/<int:record_id>", methods=["GET"])
+@audit_action("MARRIAGE_RECORD_VIEWED", resource_type="marriage_record")
 def get_record_with_pdf(record_id):
     """Returns full record metadata PLUS a base64-encoded `pdf_data` field,
     read straight from disk (self-healing the stored path if it drifted)."""
@@ -2800,6 +2910,10 @@ def get_record_with_pdf(record_id):
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
         row = res.data[0]
+        set_audit_context(
+            resource_id=record_id,
+            meta={"file_name": row.get("original_file_name"), "file_type": "pdf"},
+        )
 
         resolved = resolve_file_path(row)
         pdf_data = None
@@ -2817,46 +2931,62 @@ def get_record_with_pdf(record_id):
         payload["pdf_data"] = pdf_data
         if pdf_error:
             payload["pdf_error"] = pdf_error
+            set_audit_context(status="FAILED", meta={"pdf_error": True})
         return jsonify(payload), 200
     except Exception as e:
         return jsonify({"error": f"Failed to load record: {e}"}), 500
 
 
 @marriage_bp.route("/records/<int:record_id>/view", methods=["GET"])
+@audit_action("MARRIAGE_RECORD_PDF_VIEWED", resource_type="marriage_record")
 def view_record(record_id):
     return _serve_pdf(record_id, as_attachment=False)
 
 
 @marriage_bp.route("/records/<int:record_id>/download", methods=["GET"])
+@audit_action("MARRIAGE_RECORD_DOWNLOADED", resource_type="marriage_record")
 def download_record(record_id):
     return _serve_pdf(record_id, as_attachment=True)
 
 
 @marriage_bp.route("/records/<int:record_id>", methods=["DELETE"])
+@audit_action("MARRIAGE_RECORD_DELETED", resource_type="marriage_record")
 def delete_record(record_id):
     return _delete_record(record_id)
 
 
 @marriage_bp.route("/records/<int:record_id>/archive", methods=["PUT"])
+@audit_action("MARRIAGE_RECORD_ARCHIVED", resource_type="marriage_record")
 def archive_record(record_id):
     try:
         res = supabase.table("marriage_records").select("*").eq("id", record_id).limit(1).execute()
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
         row = res.data[0]
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": row.get("is_archived"), "file_name": row.get("file_name")},
+            new_value={"is_archived": True},
+            meta={"file_type": "pdf"},
+        )
         if row.get("is_archived"):
             return jsonify({"error": "Record is already archived."}), 400
 
         stored = os.path.basename((row.get("stored_file_name") or "").strip())
         src    = os.path.join(UPLOAD_DIR, stored) if stored else None
         new_file_path = row.get("file_path")
+        file_move_error = None
         if src and os.path.isfile(src):
             dst = os.path.join(ARCHIVE_UPLOAD_DIR, stored)
             try:
                 os.rename(src, dst)
                 new_file_path = dst
-            except Exception:
-                pass
+            except Exception as move_error:
+                file_move_error = move_error
+                _audit_marriage_file_move_failure(record_id, "archive", move_error)
+        elif stored:
+            file_move_error = FileNotFoundError("Marriage PDF source file is missing")
+            _audit_marriage_file_move_failure(record_id, "archive", file_move_error)
 
         now_iso = datetime.now().isoformat()
         # UPDATE body (not a filter), so a Python bool is fine here.
@@ -2867,14 +2997,7 @@ def archive_record(record_id):
             "file_path": new_file_path,
         }).eq("id", record_id).execute()
 
-        # Audit trail: every archive action is logged.
-        record_action(
-            "ARCHIVE",
-            f"Archived marriage record: '{row.get('file_name', record_id)}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": row.get("file_name")},
-            ip=request.remote_addr
-        )
+        set_audit_context(meta={"file_type": "pdf", "file_move_failed": bool(file_move_error)})
 
         return jsonify({"success": True, "message": "Record archived successfully."}), 200
     except Exception as e:
@@ -2882,25 +3005,37 @@ def archive_record(record_id):
 
 
 @marriage_bp.route("/records/<int:record_id>/restore", methods=["PUT"])
+@audit_action("MARRIAGE_RECORD_RESTORED", resource_type="marriage_record")
 def restore_record(record_id):
     try:
         res = supabase.table("marriage_records").select("*").eq("id", record_id).limit(1).execute()
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
         row = res.data[0]
+        set_audit_context(
+            resource_id=record_id,
+            old_value={"is_archived": row.get("is_archived"), "file_name": row.get("file_name")},
+            new_value={"is_archived": False},
+            meta={"file_type": "pdf"},
+        )
         if not row.get("is_archived"):
             return jsonify({"error": "Record is not archived."}), 400
 
         stored = os.path.basename((row.get("stored_file_name") or "").strip())
         src    = os.path.join(ARCHIVE_UPLOAD_DIR, stored) if stored else None
         new_file_path = row.get("file_path")
+        file_move_error = None
         if src and os.path.isfile(src):
             dst = os.path.join(UPLOAD_DIR, stored)
             try:
                 os.rename(src, dst)
                 new_file_path = dst
-            except Exception:
-                pass
+            except Exception as move_error:
+                file_move_error = move_error
+                _audit_marriage_file_move_failure(record_id, "restore", move_error)
+        elif stored:
+            file_move_error = FileNotFoundError("Marriage archive PDF source file is missing")
+            _audit_marriage_file_move_failure(record_id, "restore", file_move_error)
 
         now_iso = datetime.now().isoformat()
         supabase.table("marriage_records").update({
@@ -2910,15 +3045,7 @@ def restore_record(record_id):
             "file_path": new_file_path,
         }).eq("id", record_id).execute()
 
-        # Audit trail: every restore action is logged, so an unexpected call
-        # (e.g. a frontend regression) is visible immediately.
-        record_action(
-            "RESTORE",
-            f"Restored marriage record: '{row.get('file_name', record_id)}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": row.get("file_name")},
-            ip=request.remote_addr
-        )
+        set_audit_context(meta={"file_type": "pdf", "file_move_failed": bool(file_move_error)})
 
         return jsonify({"success": True, "message": "Record restored successfully."}), 200
     except Exception as e:
@@ -2930,17 +3057,30 @@ def restore_record(record_id):
 # =============================================================================
 
 @marriage_bp.route("/records/<int:record_id>/spouses", methods=["PATCH"])
+@audit_action("MARRIAGE_SPOUSES_UPDATED", resource_type="marriage_record")
 def update_spouses(record_id):
     try:
         data = request.get_json(force=True) or {}
-        exists = supabase.table("marriage_records").select("id").eq("id", record_id).limit(1).execute()
+        exists = supabase.table("marriage_records").select(
+            "id, groom_first_name, groom_middle_name, groom_last_name, "
+            "bride_first_name, bride_middle_name, bride_last_name"
+        ).eq("id", record_id).limit(1).execute()
         if not exists.data:
             return jsonify({"error": "Record not found."}), 404
+        old_values = {field: exists.data[0].get(field) for field in (
+            "groom_first_name", "groom_middle_name", "groom_last_name",
+            "bride_first_name", "bride_middle_name", "bride_last_name",
+        )}
 
         fields = ["groom_first_name", "groom_middle_name", "groom_last_name",
                   "bride_first_name",  "bride_middle_name",  "bride_last_name"]
         update_payload = {f: clean(data.get(f)) for f in fields}
         update_payload["updated_at"] = datetime.now().isoformat()
+        set_audit_context(
+            resource_id=record_id,
+            old_value=old_values,
+            new_value={field: update_payload[field] for field in fields},
+        )
 
         supabase.table("marriage_records").update(update_payload).eq("id", record_id).execute()
         return jsonify({"success": True}), 200
@@ -2953,6 +3093,7 @@ def update_spouses(record_id):
 # =============================================================================
 
 @marriage_bp.route("/records/complete", methods=["POST"])
+@audit_action("MARRIAGE_TRANSACTION_COMPLETED", resource_type="marriage_transaction")
 def complete_transaction():
     try:
         data              = request.get_json(force=True) or {}
@@ -2964,6 +3105,13 @@ def complete_transaction():
         payment_amount    = data.get("paymentAmount", 75)
         document_type     = clean(data.get("documentType"))     or "marriage"
         document_issued   = clean(data.get("documentIssued"))   or "Marriage Certificate"
+        set_audit_context(meta={
+            "record_id": data.get("recordId"),
+            "record_status": record_status,
+            "payment_amount": data.get("paymentAmount", 75),
+            "payment_method": payment_method,
+            "document_type": document_type,
+        })
 
         groom_first_name  = clean(data.get("groom_first_name")  or data.get("groomFirstName"))
         groom_middle_name = clean(data.get("groom_middle_name") or data.get("groomMiddleName"))
@@ -3038,6 +3186,7 @@ def complete_transaction():
         if not insert_res.data:
             return jsonify({"error": "Failed to save transaction."}), 500
         transaction_id = insert_res.data[0]["id"]
+        set_audit_context(resource_id=transaction_id)
 
         # NOTIFICATION: only when the record was FOUND and it matches an
         # online request (see _matches_online_marriage_request()).
@@ -3080,6 +3229,7 @@ def _normalize_payment_status_marriage(record_status):
 
 
 @marriage_bp.route("/payments", methods=["GET"])
+@audit_action("MARRIAGE_PAYMENTS_VIEWED", resource_type="marriage_transaction", dedupe_window_seconds=300)
 def get_payments():
     try:
         limit = min(max(request.args.get("limit", default=500, type=int), 1), 1000)
@@ -3097,6 +3247,7 @@ def get_payments():
         agg_res        = supabase.table("marriage_transactions").select("payment_amount").execute()
         total_requests = len(agg_res.data)
         total_payments = sum(float(r.get("payment_amount") or 0) for r in agg_res.data)
+        set_audit_context(meta={"result_count": len(rows), "total_count": total_requests})
 
         payments = []
         for row in rows:
@@ -3110,6 +3261,8 @@ def get_payments():
                 row[f] = row.get(f) or ""
             row["full_name"] = row.get("full_name") or ""
             payments.append(row)
+
+        set_audit_context(meta={"result_count": len(payments), "total_count": total_requests})
 
         return jsonify({
             "payments":       payments,
