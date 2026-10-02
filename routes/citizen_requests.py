@@ -15,51 +15,29 @@ avoid depending on a require_admin() helper that may not exist yet.
 Swap _staff_required() below for a proper permission-based decorator
 once one is available.
 
+NOTIFICATION BEHAVIOR (current):
+  * Being Processed -> message "Status updated to Being Processed", NO email.
+  * Completed       -> message "Status updated to Completed",       email sent.
+  * Rejected        -> message "Status updated to Rejected",        email sent.
+  * Pending Review  -> never sends an email.
+  Only Completed and Rejected trigger a Gmail/email notification
+  (see NOTIFY_ON_STATUSES). No row is written to `notification` for a
+  status update, so the admin bell stays quiet for these.
+
 Status updates email the citizen at the address they gave on the request
 form (`requester_email`) via email_service.send_status_update_email.
-No row is written to `notification` for a status update, so the admin
-bell stays quiet for these.
 
-Only Pending Review, Being Processed, and Completed are selectable
-statuses (REJECTED remains available as a separate terminal state).
-
-CHANGED (fix for HTTP 500 on PATCH /api/requests/<id>/status):
-  * The email / audit-log steps used to run inline, one after the
-    other, inside the same try/except that returns a 500. If any of them
-    hung (Render's free tier blocks outbound SMTP ports 25/465/587, so
-    smtplib waited on a connection that never came, until the gunicorn
-    worker was killed) or raised (e.g. record_action throwing), the
-    citizen-facing update looked like it failed even though the DB row
-    had already been saved.
-  * Email now runs in a worker thread with a hard timeout
-    (NOTIFY_TIMEOUT_SECONDS). A timeout or exception there just counts
-    as "not sent" — it can never turn into a 500.
+Earlier fixes kept in this file:
+  * Email runs in a worker thread with a hard timeout
+    (NOTIFY_TIMEOUT_SECONDS), so a hung SMTP connection can never turn
+    into a 500.
   * The audit-log write is wrapped separately so a logging problem can't
-    fail the request either.
-  * The DB update has its own try/except, so if the save itself fails
-    the response says so clearly (and the real traceback is printed to
-    the server log) instead of a generic error.
-  * Fixed has_signature in the detail endpoint: it used to read
-    signature_path AFTER popping it, so it was always False.
-
-CHANGED (notify-channel selection):
-  * The frontend's "Notify requester via" control sends `notify_via` in
-    the PATCH body; the endpoint reads it and only notifies when the
-    channel was actually selected.
-  * The response's `message` (what the admin's success/notice toast
-    displays) includes the actual email address that was notified.
-
-CHANGED (SMS removed — email only):
-  * Semaphore SMS is a paid, prepaid service, so SMS notifications have
-    been dropped. sms_service.py is no longer imported or used here (the
-    file can be deleted, along with the SEMAPHORE_API_KEY /
-    SEMAPHORE_SENDER_NAME environment variables).
-  * `notify_via` now only accepts "email" or "none". Anything else —
-    including "sms" / "both" from an older cached frontend, or a missing
-    value — falls back to "email".
-  * The response no longer contains `sms_sent` or `notified_phone`.
-  * The requester's phone number is still stored, listed and returned
-    everywhere else exactly as before; it just isn't texted.
+    fail the request.
+  * The DB update has its own try/except so a failed save is reported
+    clearly.
+  * has_signature in the detail endpoint is read BEFORE signature_path
+    is popped.
+  * `notify_via` only accepts "email" or "none" (SMS was removed).
 """
 
 import traceback
@@ -93,8 +71,9 @@ ALL_STATUSES = list(STATUS_LABELS.keys())
 # falls back to "email".
 VALID_NOTIFY_VIA = {"email", "none"}
 
-# The citizen is emailed when a request is processed, completed, or rejected.
-NOTIFY_ON_STATUSES = {"PROCESSING", "COMPLETED", "REJECTED"}
+# The citizen is emailed ONLY when a request is completed or rejected.
+# PENDING and PROCESSING never send an email.
+NOTIFY_ON_STATUSES = {"COMPLETED", "REJECTED"}
 
 # Permission key the frontend checks via hasAccess("citizen_requests").
 # An admin (is_admin() == True) always passes regardless of this list.
@@ -309,6 +288,8 @@ def update_citizen_request_status(record_id):
             return jsonify({"error": f"Could not save the new status: {db_err}"}), 500
 
         status_label = STATUS_LABELS.get(new_status, new_status)
+
+        # Body of the email sent to the citizen (Completed / Rejected only).
         if new_status == "REJECTED":
             message = (
                 f"We're sorry, but your {kind} certificate request "
@@ -326,27 +307,25 @@ def update_citizen_request_status(record_id):
         requester_email = row.get("requester_email")
         status_triggers_email = new_status in NOTIFY_ON_STATUSES
 
-        if notify_via == "none" or not status_triggers_email:
-            email_sent = False
-        else:
+        # An email is only attempted if the admin chose "email" AND the
+        # status is Completed or Rejected. Being Processed and Pending
+        # Review never send an email.
+        email_attempted = notify_via == "email" and status_triggers_email
+
+        if email_attempted:
             email_sent = _send_email_notification(
                 to_email=requester_email,
                 subject=f"{kind.title()} Certificate Request — {status_label}",
                 body=message,
             )
+        else:
+            email_sent = False
 
         email_skipped = notify_via != "none" and not status_triggers_email
 
-        if email_sent:
-            notify_status_message = f"Status updated. Citizen notified by email ({requester_email})."
-        elif notify_via == "none":
-            notify_status_message = "Status updated. No notification was sent (none selected)."
-        elif email_skipped:
-            notify_status_message = f"Status updated to {status_label}."
-        elif not requester_email:
-            notify_status_message = "Status updated, but no email address is on file for this request — citizen was not notified."
-        else:
-            notify_status_message = "Status updated, but the email notification failed to send. Check server logs."
+        # Exact notification message for every status:
+        #   "Status updated to Being Processed" / "... Completed" / "... Rejected"
+        notify_status_message = f"Status updated to {status_label}"
 
         # ── 3. Audit log (best-effort). ──
         _safe_record_action(
@@ -361,6 +340,7 @@ def update_citizen_request_status(record_id):
                 "note": note,
                 "notify_via": notify_via,
                 "email_sent": email_sent,
+                "email_attempted": email_attempted,
                 "email_skipped": email_skipped,
             },
             ip=request.remote_addr,
@@ -376,6 +356,7 @@ def update_citizen_request_status(record_id):
             "updated_at": now_iso,
             "notify_via": notify_via,
             "email_sent": email_sent,
+            "email_attempted": email_attempted,
             "email_skipped": email_skipped,
             "notified_email": requester_email if email_sent else None,
             "message": notify_status_message,
