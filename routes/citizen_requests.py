@@ -27,6 +27,13 @@ NOTIFICATION BEHAVIOR (current):
 Status updates email the citizen at the address they gave on the request
 form (`requester_email`) via email_service.send_status_update_email.
 
+SIGNATURE (detail endpoint):
+  The signature file lives in the private Supabase Storage bucket
+  "signatures" (uploaded by backend/request.py). An <img> tag cannot send
+  an auth header, so the detail endpoint returns `signature_url`: a
+  short-lived signed URL the browser can load directly. The raw storage
+  path (`signature_path`) is never exposed.
+
 Earlier fixes kept in this file:
   * Email runs in a worker thread with a hard timeout
     (NOTIFY_TIMEOUT_SECONDS), so a hung SMTP connection can never turn
@@ -84,6 +91,11 @@ REQUIRED_PERMISSION = "citizen_requests"
 # request always finishes and returns JSON.
 NOTIFY_TIMEOUT_SECONDS = 15
 
+# Private bucket written by backend/request.py, and how long a signed
+# signature link stays valid (the modal re-fetches on every open).
+SIGNATURE_BUCKET = "signatures"
+SIGNATURE_URL_TTL_SECONDS = 3600
+
 
 def get_user():
     return session.get("username", "System")
@@ -116,6 +128,22 @@ def who(kind, r):
         return f"{r.get('husband_fullname')} & {r.get('wife_maiden_name')}"
     p = "child" if kind == "birth" else "deceased"
     return f"{r.get(p + '_firstname') or ''} {r.get(p + '_surname') or ''}".strip()
+
+
+def _signed_signature_url(path):
+    """Short-lived signed URL for a file in the private signatures bucket.
+    Returns None (never raises) if the file is missing or signing fails,
+    so the detail endpoint still works without the image."""
+    if not path:
+        return None
+    try:
+        res = supabase.storage.from_(SIGNATURE_BUCKET).create_signed_url(
+            path, SIGNATURE_URL_TTL_SECONDS
+        )
+        return (res or {}).get("signedURL") or (res or {}).get("signedUrl")
+    except Exception as e:
+        print(f"[citizen_requests] could not sign signature URL for {path}: {e}")
+        return None
 
 
 def _send_email_notification(to_email, subject, body):
@@ -225,14 +253,19 @@ def get_citizen_request_detail(record_id):
 
         # Read signature_path BEFORE popping it (it used to be read after,
         # which meant has_signature was always False).
-        has_signature = bool(row.get("signature_path"))
-        row.pop("signature_path", None)
+        signature_path = row.pop("signature_path", None)
+        has_signature = bool(signature_path)
 
         kind = (row.get("record_type") or "birth").lower()
         row["who"] = who(kind, row)
         st = (row.get("status") or "PENDING").upper()
         row["status_label"] = STATUS_LABELS.get(st, st)
         row["has_signature"] = has_signature
+        # Short-lived link the <img> in the admin modal can load directly.
+        row["signature_url"] = _signed_signature_url(signature_path)
+        # backend/request.py refuses to save a request unless the email was
+        # verified, so any request that has an email went through that check.
+        row["email_verified"] = bool(row.get("requester_email"))
         return jsonify(row)
     except Exception as e:
         traceback.print_exc()
