@@ -52,7 +52,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime, timezone
 from functools import wraps
 
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, request, jsonify, session, Response
 
 from supabase_client import supabase
 from auth.Rolemanagement import is_admin, get_user_permissions
@@ -95,6 +95,13 @@ NOTIFY_TIMEOUT_SECONDS = 15
 # signature link stays valid (the modal re-fetches on every open).
 SIGNATURE_BUCKET = "signatures"
 SIGNATURE_URL_TTL_SECONDS = 3600
+SIGNATURE_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "pdf": "application/pdf",
+}
 
 
 def get_user():
@@ -270,6 +277,36 @@ def get_citizen_request_detail(record_id):
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@citizen_requests_bp.route("/api/requests/<int:record_id>/signature", methods=["GET"])
+@_staff_required
+def get_citizen_request_signature(record_id):
+    """Serves the signature file for the admin modal's <img>. Session-gated
+    (the browser sends the login cookie with <img> requests), so no header
+    or signed URL is needed. The file is read from the private bucket."""
+    try:
+        rows = (
+            supabase.table(REQUEST_TABLE)
+            .select("signature_path")
+            .eq("id", record_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        path = rows[0].get("signature_path") if rows else None
+        if not path:
+            return jsonify({"error": "Signature not found"}), 404
+
+        raw = supabase.storage.from_(SIGNATURE_BUCKET).download(path)
+        ext = path.rsplit(".", 1)[-1].lower()
+        resp = Response(raw, mimetype=SIGNATURE_MIME.get(ext, "application/octet-stream"))
+        resp.headers["Cache-Control"] = "private, max-age=300"
+        return resp
+    except Exception as e:
+        print(f"[citizen_requests] signature fetch failed for request {record_id}: {e}")
+        traceback.print_exc()
+        return jsonify({"error": "Could not load signature."}), 500
 
 
 @citizen_requests_bp.route("/api/requests/<int:record_id>/status", methods=["PATCH"])
