@@ -1,5 +1,5 @@
 import bcrypt
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from logs.Audits import audit_action, set_audit_context
 from supabase_client import supabase
@@ -7,7 +7,6 @@ from supabase_client import supabase
 death_archive_bp = Blueprint("death_archive", __name__)
 
 SEED_MODULES = ["death_record", "archive_death"]
-DEFAULT_PASSWORD = "123456"
 
 
 # ─── Password helpers ────────────────────────────────────────────────────────
@@ -29,19 +28,7 @@ def _verify_password(plain_password: str, stored_hash) -> bool:
 # ─── DB initialisation ───────────────────────────────────────────────────────
 
 def init_death_archive_db():
-    try:
-        for module in SEED_MODULES:
-            res = supabase.table("module_passwords").select("id").eq("module_key", module).execute()
-            if not res.data:
-                supabase.table("module_passwords").insert({
-                    "module_key": module,
-                    "password_hash": _hash_password(DEFAULT_PASSWORD),
-                }).execute()
-                print(f"[init_death_archive_db] Seeded: {module}")
-            else:
-                print(f"[init_death_archive_db] Already exists: {module}")
-    except Exception as e:
-        print(f"[init_death_archive_db] ERROR: {e}")
+    print("[init_death_archive_db] no default passwords are seeded")
 
 
 # ─── VERIFY PASSWORD ──────────────────────────────────────────────────────────
@@ -63,21 +50,12 @@ def verify_module_password():
         res = supabase.table("module_passwords").select("password_hash").eq("module_key", module).execute()
         row = res.data[0] if res.data else None
 
-        if row is None:
-            default_hash = _hash_password(DEFAULT_PASSWORD)
-            # Mirrors the original's ON DUPLICATE KEY UPDATE password_hash = password_hash
-            # (i.e. insert-if-missing, never clobber a hash that already exists).
-            existing = supabase.table("module_passwords").select("id").eq("module_key", module).execute()
-            if not existing.data:
-                supabase.table("module_passwords").insert({
-                    "module_key": module,
-                    "password_hash": default_hash,
-                }).execute()
-            res = supabase.table("module_passwords").select("password_hash").eq("module_key", module).execute()
-            row = res.data[0] if res.data else None
-
-        if not row:
-            return jsonify({"success": False, "message": "Password record not found."}), 404
+        if not row or not row.get("password_hash"):
+            return jsonify({
+                "success": False,
+                "message": "No password is set for this module. Ask an administrator to set one.",
+                "code": "NOT_CONFIGURED"
+            }), 404
 
         stored_hash = row["password_hash"]
 
@@ -105,20 +83,27 @@ def change_module_password():
 
         if module not in SEED_MODULES:
             return jsonify({"success": False, "message": "Unknown module."}), 400
-        if not current_password:
-            return jsonify({"success": False, "message": "Current password is required."}), 400
         if not new_password:
             return jsonify({"success": False, "message": "New password is required."}), 400
         if len(new_password) < 6:
             return jsonify({"success": False, "message": "New password must be at least 6 characters."}), 400
-        if current_password == new_password:
+        if current_password and current_password == new_password:
             return jsonify({"success": False, "message": "New password must be different from current password."}), 400
 
         res = supabase.table("module_passwords").select("password_hash").eq("module_key", module).execute()
         row = res.data[0] if res.data else None
 
-        if not row:
-            return jsonify({"success": False, "message": "Module password record not found."}), 404
+        if not row or not row.get("password_hash"):
+            if not session.get("is_admin"):
+                return jsonify({"success": False, "message": "Only an administrator can set the first password."}), 403
+            supabase.table("module_passwords").insert({
+                "module_key": module,
+                "password_hash": _hash_password(new_password),
+            }).execute()
+            return jsonify({"success": True, "message": "Password created."}), 200
+
+        if not current_password:
+            return jsonify({"success": False, "message": "Current password is required."}), 400
 
         stored_hash = row["password_hash"]
 
