@@ -1,5 +1,5 @@
 import bcrypt
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from logs.Audits import audit_action, set_audit_context
 from supabase_client import supabase
@@ -7,7 +7,6 @@ from supabase_client import supabase
 marriage_auth_bp = Blueprint("marriage_auth_bp", __name__)
 
 SEED_MODULES = ["marriage_record", "archive_marriage"]
-DEFAULT_PASSWORD = "123456"
 
 
 # ─────────────────────────────────────────────
@@ -40,34 +39,20 @@ def _verify(plain: str, hashed) -> bool:
 # ─────────────────────────────────────────────
 
 def seed_module_passwords():
+    """Migrate any legacy plaintext `password` to a bcrypt hash. Never creates a default."""
     for mod in SEED_MODULES:
         res = supabase.table("module_passwords").select("id, password_hash, password").eq("module_key", mod).execute()
         row = res.data[0] if res.data else None
-
         if not row:
-            supabase.table("module_passwords").insert({
-                "module_key": mod,
-                "password_hash": _hash(DEFAULT_PASSWORD),
-                "password": None,
-            }).execute()
-            print(f"[seed] created '{mod}'")
             continue
-
-        password_hash = row.get("password_hash")
-        legacy_password = row.get("password")
-        hash_ok = bool(password_hash and str(password_hash).startswith("$2"))
-
-        if not hash_ok:
-            source = legacy_password if legacy_password else DEFAULT_PASSWORD
+        hash_ok = bool(row.get("password_hash") and str(row["password_hash"]).startswith("$2"))
+        legacy = row.get("password")
+        if not hash_ok and legacy:
             supabase.table("module_passwords").update({
-                "password_hash": _hash(source),
-                "password": None,
+                "password_hash": _hash(legacy), "password": None,
             }).eq("id", row["id"]).execute()
-            print(f"[seed] repaired '{mod}'")
-        elif legacy_password is not None:
-            supabase.table("module_passwords").update({
-                "password": None,
-            }).eq("id", row["id"]).execute()
+        elif legacy is not None:
+            supabase.table("module_passwords").update({"password": None}).eq("id", row["id"]).execute()
 
 
 # NOTE: marriage_records table creation removed — routes/marriage.py already
@@ -103,8 +88,8 @@ def verify_module_password():
         res = supabase.table("module_passwords").select("password_hash").eq("module_key", module).execute()
         row = res.data[0] if res.data else None
 
-        if not row:
-            return jsonify({"success": False, "message": "Module password not found."}), 404
+        if not row or not row.get("password_hash"):
+            return jsonify({"success": False, "message": "No password is set for this module.", "code": "NOT_CONFIGURED"}), 404
 
         stored_hash = row["password_hash"]
 
@@ -130,13 +115,11 @@ def change_marriage_module_password():
 
         if module not in SEED_MODULES:
             return jsonify({"success": False, "message": "Unknown module."}), 400
-        if not current_pw:
-            return jsonify({"success": False, "message": "Current password is required."}), 400
         if not new_pw:
             return jsonify({"success": False, "message": "New password is required."}), 400
         if len(new_pw) < 6:
             return jsonify({"success": False, "message": "New password must be at least 6 characters."}), 400
-        if current_pw == new_pw:
+        if current_pw and current_pw == new_pw:
             return jsonify({"success": False, "message": "New password must be different from current password."}), 400
 
         seed_module_passwords()
@@ -144,8 +127,18 @@ def change_marriage_module_password():
         res = supabase.table("module_passwords").select("id, password_hash").eq("module_key", module).execute()
         row = res.data[0] if res.data else None
 
-        if not row:
-            return jsonify({"success": False, "message": "Module password not found."}), 404
+        if not row or not row.get("password_hash"):
+            if not session.get("is_admin"):
+                return jsonify({"success": False, "message": "Only an administrator can set the first password."}), 403
+            supabase.table("module_passwords").insert({
+                "module_key": module,
+                "password_hash": _hash(new_pw),
+                "password": None,
+            }).execute()
+            return jsonify({"success": True, "message": "Password created."}), 200
+
+        if not current_pw:
+            return jsonify({"success": False, "message": "Current password is required."}), 400
 
         if not _verify(current_pw, row["password_hash"]):
             return jsonify({"success": False, "message": "Current password is incorrect.", "code": "INVALID_PASSWORD"}), 401
@@ -160,11 +153,3 @@ def change_marriage_module_password():
     except Exception as e:
         print(f"[change_marriage_module_password] Error: {e}")
         return jsonify({"success": False, "message": f"Server error: {e}"}), 500
-
-# Record CRUD (list_records, list_archived, upload_record, get_record,
-# download_record, archive_record, restore_record, delete_record)
-# intentionally removed here — routes/marriage.py already owns
-# marriage_records CRUD against Supabase with the real ~50-column schema.
-# Tell me if these specific /api/marriage/records... endpoints under this
-# blueprint are still called separately by the frontend and I'll add them
-# back, pointed at the same table with matching columns.

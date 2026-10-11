@@ -1,4 +1,3 @@
-
 """Shared security helpers so every sensitive route is protected the same way."""
 import re
 from functools import wraps
@@ -9,6 +8,26 @@ VERCEL_ORIGIN_PATTERNS = [
     re.compile(r"^https://civil-registry-scc\.vercel\.app$"),
     re.compile(r"^https://civil-registry(-[a-z0-9]+)*-joshua-paracuelles-projects\.vercel\.app$"),
 ]
+
+# Must match ENTITY_PERMISSIONS in src/offline/syncScope.js.
+ENTITY_PERMISSIONS = {
+    "birth":    ["birth_verification", "birth_archive_uploader"],
+    "death":    ["death_verification", "death_archive_uploader"],
+    "marriage": ["marriage_verification", "marriage_archive_uploader"],
+    "tracking": [
+        "document_tracking",
+        "document_stage_registration",
+        "document_stage_civil_registrar",
+        "document_stage_posting_period",
+        "document_stage_records_division",
+        "document_stage_registry_number",
+        "document_stage_releasing",
+    ],
+}
+
+# Only changes are guarded. Reads stay open so the dashboard and analytics
+# keep working for every role.
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 def _is_vercel_origin(origin: str) -> bool:
@@ -24,6 +43,46 @@ def login_required_hook():
         audit_denial("Authentication required")
         return jsonify({"error": "Not authenticated"}), 401
     return None
+
+
+def _current_permissions():
+    """The logged-in user's permission set, cached once per request.
+    Returns None when nobody is logged in (login_required_hook answers 401)."""
+    username = session.get("username")
+    if not username:
+        return None
+    if has_request_context() and hasattr(g, "_request_perms"):
+        return g._request_perms
+    # Lazy import avoids a cycle: Rolemanagement imports this module.
+    from auth.Rolemanagement import get_user_permissions
+    perms = set(get_user_permissions(username) or [])
+    if has_request_context():
+        g._request_perms = perms
+    return perms
+
+
+def entity_permission_hook(entity):
+    """Blocks mutating requests (POST/PUT/PATCH/DELETE) unless the user's role
+    includes one of the permissions for `entity` (birth, death, marriage,
+    tracking). Administrators hold every module, so they pass automatically."""
+    if entity not in ENTITY_PERMISSIONS:
+        raise ValueError(f"Unknown entity: {entity!r}")
+    required = ENTITY_PERMISSIONS[entity]
+
+    def _hook():
+        if request.method not in MUTATING_METHODS:
+            return None
+        perms = _current_permissions()
+        if perms is None:
+            return None  # not logged in: the login hook / route handles it
+        if "*" in perms or any(p in perms for p in required):
+            return None
+        audit_denial(f"Module '{entity}' is not in the user's role permissions")
+        return jsonify({
+            "error": f"Access denied — your role does not include the {entity} module"
+        }), 403
+
+    return _hook
 
 
 def _is_admin(username):

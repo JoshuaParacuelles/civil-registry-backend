@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -10,37 +11,16 @@ ADMIN_ONLY_MODULES = {"role_management", "user_management", "audit_logs"}
 RESERVED_ADMIN_USERNAME = "admin"
 
 # Session lifetimes (seconds). Stored INSIDE each session as `ttl` and enforced
-# by enforce_session_expiry() in app.py. Do NOT change
-# app.config['PERMANENT_SESSION_LIFETIME'] per login: that value is global to
-# the whole process, and Flask uses it to validate every session cookie's age.
+# by enforce_session_expiry() in app.py.
 SESSION_TTL_DEFAULT = 24 * 3600
 SESSION_TTL_REMEMBER_ME = 7 * 24 * 3600
 
-# The single source of truth for which column holds the password hash.
-# Rolemanagement.py (account creation, password reset, and the bootstrap
-# 'admin' user) exclusively writes to a column called 'password'. The old
-# version of this file guessed between several possible column names
-# ('password_hash', 'password', 'pass_hash', ...) and picked whichever one
-# appeared first in that list — if the users table also had an unused
-# 'password_hash' column sitting around, it would be picked over the real
-# 'password' column, read as None, and cause every login to fail with
-# "Invalid credentials" even with the correct password.
+# Single source of truth for which column holds the password hash.
 PASSWORD_COLUMN = "password"
 
 # ─────────────────────────────────────────────
-# ATTEMPT / LOCKOUT CONFIG
+# ATTEMPT / LOCKOUT CONFIG (online, stored in Supabase)
 # ─────────────────────────────────────────────
-# Each "cycle" gives the account MAX_LOGIN_ATTEMPTS failed tries before it is
-# locked. The lock duration escalates with each *consecutive* lockout:
-#   tier 1 -> 5 minutes
-#   tier 2 -> 10 minutes
-#   tier 3 -> 24 hours
-# A successful login is the only thing that resets the tier back to 0.
-# Beyond tier 3 the spec doesn't say what happens on a further failure cycle,
-# so this caps at the 24h duration (tier stays at 3) rather than escalating
-# further or wrapping back to 5 minutes. Change MAX_LOCK_TIER's behavior
-# below (the `min(..., MAX_LOCK_TIER)` line) if you'd rather have it wrap
-# back to tier 1 after a 24h lock is served.
 MAX_LOGIN_ATTEMPTS = 3
 LOCK_TIER_SECONDS = {
     1: 5 * 60,            # 5 minutes
@@ -49,16 +29,22 @@ LOCK_TIER_SECONDS = {
 }
 MAX_LOCK_TIER = 3
 
-# Column semantics for the two columns that already existed on `users`:
-#   lock_level -> escalation tier (0..MAX_LOCK_TIER). PERSISTS across an
-#                 unlock so the *next* lockout in a row escalates. Only a
-#                 successful login resets it to 0.
-#   lock_time  -> the UTC timestamp the CURRENT lock EXPIRES AT (not when it
-#                 started). NULL whenever there is no active lock. This
-#                 lets "is currently locked" be a single now()-comparison
-#                 instead of needing to also know the tier's duration.
-# `login_attempts` keeps its original meaning: failed tries in the current
-# (post-unlock) cycle. `temp_attempts` is left untouched/unused.
+# ─────────────────────────────────────────────
+# LOCAL USER CACHE (offline fallback)
+# ─────────────────────────────────────────────
+# When Supabase can't be reached (no internet / brownout / outage), login falls
+# back to this file. It only ever stores the salted password HASH, never the
+# plain password. Add `local_users.json` to .gitignore.
+#
+# The file is filled in two ways:
+#   1. Automatically after every successful ONLINE login.
+#   2. Manually with seed_local_users.py (for users who never logged in online).
+LOCAL_USERS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_users.json"
+)
+
+OFFLINE_MAX_ATTEMPTS = 5
+OFFLINE_LOCK_SECONDS = 5 * 60
 
 
 def hash_password(password):
@@ -98,10 +84,7 @@ def _parse_ts(value):
 def compute_lock_status(user):
     """
     Returns (is_locked, seconds_remaining, lock_level) for a user row,
-    based on the persisted lock_level / lock_time columns. Always computed
-    fresh against the current time so a lock that has simply timed out
-    (but hasn't been written back to the DB yet by a login attempt) is
-    correctly reported as unlocked.
+    computed fresh against the current time.
     """
     lock_level = user.get('lock_level') or 0
     locked_until = _parse_ts(user.get('lock_time'))
@@ -123,6 +106,141 @@ def _format_duration(seconds):
         return f"{hrs} hour{'s' if hrs != 1 else ''}"
     mins = max(1, round(seconds / 60))
     return f"{mins} minute{'s' if mins != 1 else ''}"
+
+
+# ─────────────────────────────────────────────
+# LOCAL CACHE HELPERS
+# ─────────────────────────────────────────────
+def _load_local_users():
+    try:
+        with open(LOCAL_USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[LOCAL CACHE] Could not read {LOCAL_USERS_FILE}: {e}")
+        return {}
+
+
+def _write_local_users(data):
+    try:
+        tmp = LOCAL_USERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, LOCAL_USERS_FILE)
+        return True
+    except Exception as e:
+        print(f"[LOCAL CACHE] Could not write {LOCAL_USERS_FILE}: {e}")
+        return False
+
+
+def _save_local_user(user, role_names, permissions):
+    """Copy the user (hash only) into the local cache after an online login."""
+    try:
+        data = _load_local_users()
+        key = user["username"].strip().lower()
+        previous = data.get(key, {})
+        data[key] = {
+            "id": user["id"],
+            "username": user["username"],
+            "password": user[PASSWORD_COLUMN],
+            "roles": list(role_names),
+            "permissions": sorted(permissions),
+            "saved_at": now_iso(),
+            "fail_count": 0,
+            "locked_until": None,
+        }
+        # keep nothing else from the previous record; it is fully refreshed
+        _ = previous
+        _write_local_users(data)
+    except Exception as e:
+        print(f"[LOCAL CACHE ERROR] {e}")
+
+
+def _offline_login(username, password):
+    """Verify against the local cache when Supabase is unreachable."""
+    key = (username or "").strip().lower()
+    data = _load_local_users()
+    rec = data.get(key)
+
+    if not rec:
+        return jsonify({
+            "success": False,
+            "message": "Server database is unavailable and this account has no saved offline login."
+        }), 503
+
+    # Offline lockout (stored in the local file so a refresh can't bypass it)
+    locked_until = _parse_ts(rec.get("locked_until"))
+    now = datetime.now(timezone.utc)
+    if locked_until and now < locked_until:
+        remaining = int((locked_until - now).total_seconds())
+        return jsonify({
+            "success": False,
+            "message": f"Account is locked. Please try again in {_format_duration(remaining)}.",
+            "lock_seconds_remaining": remaining,
+        }), 403
+
+    if not verify_password(password, rec.get("password", "")):
+        fails = (rec.get("fail_count") or 0) + 1
+        rec["fail_count"] = fails
+        if fails >= OFFLINE_MAX_ATTEMPTS:
+            rec["fail_count"] = 0
+            rec["locked_until"] = (now + timedelta(seconds=OFFLINE_LOCK_SECONDS)).isoformat()
+            _write_local_users(data)
+            return jsonify({
+                "success": False,
+                "message": (
+                    f"Account locked after {OFFLINE_MAX_ATTEMPTS} failed attempts. "
+                    f"Please try again in {_format_duration(OFFLINE_LOCK_SECONDS)}."
+                ),
+                "lock_seconds_remaining": OFFLINE_LOCK_SECONDS,
+            }), 403
+        _write_local_users(data)
+        return jsonify({
+            "success": False,
+            "message": "Invalid username or password."
+        }), 401
+
+    # Correct password
+    rec["fail_count"] = 0
+    rec["locked_until"] = None
+    _write_local_users(data)
+
+    perms = set(rec.get("permissions", []))
+    roles = rec.get("roles", [])
+    is_admin_flag = "*" in perms or rec["username"].lower() == RESERVED_ADMIN_USERNAME
+    if is_admin_flag:
+        perms.add("*")
+    perms.add("dashboard")
+
+    session.clear()
+    session['user_id'] = rec["id"]
+    session['username'] = rec["username"]
+    session['is_admin'] = is_admin_flag
+    session['role'] = ", ".join(roles) if roles else (
+        "Administrator" if is_admin_flag else "User"
+    )
+    session['logged_in_at'] = now_iso()
+    session['ttl'] = SESSION_TTL_DEFAULT
+    session['last_seen'] = datetime.now(timezone.utc).timestamp()
+    session['offline_mode'] = True
+    session.permanent = True
+
+    print(f"[LOGIN] OFFLINE login for '{rec['username']}'")
+
+    return jsonify({
+        "success": True,
+        "message": "Login successful (offline mode)",
+        "user": {
+            "id": rec["id"],
+            "username": rec["username"],
+            "is_admin": is_admin_flag,
+            "is_locked": False,
+            "roles": roles,
+            "permissions": sorted(perms),
+        },
+    }), 200
 
 
 # ─────────────────────────────────────────────
@@ -186,10 +304,7 @@ def safe_record_action(user_id, action, details=None, status=None):
 def get_roles_and_permissions(username):
     """
     Look up role names + flattened permission set for a username.
-
-    IMPORTANT: user_roles is keyed by 'username' (see Rolemanagement.py /
-    the roles schema), NOT 'user_id' — there is no user_id column on that
-    table. Querying by user_id silently returns zero rows.
+    user_roles is keyed by 'username', NOT 'user_id'.
     """
     role_names = []
     permissions = set()
@@ -205,8 +320,6 @@ def get_roles_and_permissions(username):
 
         for ur in user_roles:
             role = ur.get('roles', {})
-            # Supabase embeds can come back as a dict OR a single-item list
-            # depending on the relationship direction. Normalize both.
             if isinstance(role, list):
                 role = role[0] if role else {}
             if role:
@@ -229,10 +342,8 @@ def get_roles_and_permissions(username):
 
 def resolve_is_admin(username, permissions):
     """
-    users has no 'is_admin' column, so it can't be read off the row.
-    Derive it the same way Rolemanagement.py's is_admin() does: the
-    reserved 'admin' account is always admin, otherwise it's whoever
-    holds an admin-only module permission.
+    users has no 'is_admin' column. The reserved 'admin' account is always
+    admin, otherwise it's whoever holds an admin-only module permission.
     """
     if username and username.lower() == RESERVED_ADMIN_USERNAME:
         return True
@@ -282,19 +393,13 @@ def login():
             users = response.data
             print(f"[LOGIN] Found {len(users)} user(s)")
         except Exception as e:
+            # Supabase unreachable (no internet, outage, brownout recovery...)
+            # -> fall back to the locally saved hash instead of failing.
             print(f"[DB ERROR] {e}")
-            safe_record_action(None, "LOGIN_FAILED", {
-                "username": username,
-                "reason": "User lookup failed",
-            })
-            return jsonify({
-                "success": False,
-                "message": "Database error"
-            }), 500
+            print("[LOGIN] Database unreachable, trying local offline cache")
+            return _offline_login(username, password)
 
         if not users:
-            # No account to rate-limit/lock here — nothing is persisted for
-            # a username that doesn't exist, so there's nothing to escalate.
             safe_record_action(None, "LOGIN_FAILED", {"username": username, "reason": "User not found"})
             return jsonify({
                 "success": False,
@@ -315,13 +420,6 @@ def login():
             }), 500
 
         # ── LOCKOUT CHECK (before password verification) ──────────────
-        # Checked first and computed fresh against the current time, so a
-        # lock that has simply timed out is treated as unlocked even if no
-        # prior request has written that back to the row yet. A locked
-        # account never has its password checked, so failed attempts can't
-        # be probed/counted while it's locked, and clearing browser
-        # storage / switching devices / calling the API directly can't
-        # bypass this — it's evaluated purely from the DB row.
         is_locked, seconds_remaining, _ = compute_lock_status(user)
         if is_locked:
             safe_record_action(user.get('id'), "ACCOUNT_LOCKED", {
@@ -345,21 +443,15 @@ def login():
             update_fields = {'login_attempts': attempts}
 
             if attempts >= MAX_LOGIN_ATTEMPTS:
-                # 3rd (or more) failed attempt in this cycle -> lock the
-                # account, escalating the tier from whatever it was left at
-                # by the previous lockout.
                 new_tier = min((user.get('lock_level') or 0) + 1, MAX_LOCK_TIER)
                 duration = LOCK_TIER_SECONDS[new_tier]
                 locked_until = datetime.now(timezone.utc) + timedelta(seconds=duration)
                 update_fields.update({
                     'lock_level': new_tier,
                     'lock_time': locked_until.isoformat(),
-                    'login_attempts': 0,  # fresh 3 attempts once this lock is served
+                    'login_attempts': 0,
                 })
             else:
-                # Not locking yet on this attempt. Make sure any stale
-                # (already-expired) lock_time from a previous cycle is
-                # cleared so lock status stays accurate.
                 update_fields['lock_time'] = None
 
             try:
@@ -398,8 +490,7 @@ def login():
                 ),
             }), 401
 
-        # Get roles/permissions BEFORE building the session, since is_admin
-        # is derived from permissions (there's no is_admin column on users).
+        # Get roles/permissions BEFORE building the session
         role_names, permissions = get_roles_and_permissions(user['username'])
         is_admin_flag = resolve_is_admin(user['username'], permissions)
 
@@ -408,6 +499,9 @@ def login():
 
         # Always include baseline dashboard access
         permissions.add('dashboard')
+
+        # Refresh the local offline cache (hash only) after every good login
+        _save_local_user(user, role_names, permissions)
 
         # ============================================
         # SUCCESSFUL LOGIN - SET SESSION
@@ -420,22 +514,18 @@ def login():
             "Administrator" if is_admin_flag else "User"
         )
         # NOTE: with signed-cookie sessions everything below lives inside the
-        # browser cookie, which browsers silently drop above ~4 KB. If no other
-        # route reads session['user_data'], delete this line to keep the cookie small.
+        # browser cookie (~4 KB limit). Delete this if nothing reads it.
         user_data = {k: v for k, v in user.items() if k != PASSWORD_COLUMN}
         session['user_data'] = user_data
         session['logged_in_at'] = now_iso()
 
-        # Per-session lifetime, enforced by enforce_session_expiry() in app.py.
         session['ttl'] = SESSION_TTL_REMEMBER_ME if remember_me else SESSION_TTL_DEFAULT
         session['last_seen'] = datetime.now(timezone.utc).timestamp()
         session.permanent = True
 
         print(f"[LOGIN] Session set for user: {username}")
 
-        # Update last login time. A successful login is the only thing that
-        # fully resets the attempt/lockout state, including the escalation
-        # tier — start clean next time the account has a failure.
+        # Successful login fully resets the attempt/lockout state.
         try:
             update_data = {
                 'last_login': now_iso(),
@@ -539,6 +629,38 @@ def logout_beacon():
     return '', 204
 
 
+def _session_from_local_cache():
+    """Build a /api/session response from the local cache when the DB is down,
+    so an already-logged-in user isn't kicked out during an outage."""
+    username = session.get('username')
+    rec = _load_local_users().get((username or "").strip().lower())
+    if not rec:
+        return None
+
+    perms = set(rec.get("permissions", []))
+    roles = rec.get("roles", [])
+    is_admin_flag = "*" in perms or rec["username"].lower() == RESERVED_ADMIN_USERNAME
+    if is_admin_flag:
+        perms.add("*")
+    perms.add("dashboard")
+
+    return jsonify({
+        "authenticated": True,
+        "is_admin": is_admin_flag,
+        "role": roles[0] if roles else None,
+        "permissions": list(perms),
+        "offline": True,
+        "user": {
+            "id": rec["id"],
+            "username": rec["username"],
+            "is_admin": is_admin_flag,
+            "is_locked": False,
+            "roles": roles,
+            "permissions": list(perms),
+        },
+    }), 200
+
+
 @login_bp.route('/api/session', methods=['GET'])
 @login_bp.route('/api/my-permissions', methods=['GET'])
 def get_session():
@@ -575,12 +697,8 @@ def get_session():
             if is_admin_flag:
                 permissions.add('*')
 
-            # Ensure baseline access
             permissions.add('dashboard')
 
-            # Computed fresh (not read straight off lock_level) so this
-            # reflects an auto-expired lock immediately, rather than
-            # whatever lock_level was last written to the row.
             is_locked, _, _ = compute_lock_status(user)
 
             return jsonify({
@@ -599,12 +717,13 @@ def get_session():
             }), 200
 
         except Exception as e:
-            # A transient Supabase/network error (timeout, dropped connection,
-            # Render cold start) lands here. The login itself is still valid,
-            # so do NOT clear the session — doing so turned any one-off backend
-            # hiccup into a permanent logout. Report a temporary failure instead
-            # and let the client retry on its next poll/focus.
+            # Transient Supabase/network error: the login itself is still valid,
+            # so do NOT clear the session. Use the local cache if we have one,
+            # otherwise report a temporary failure and let the client retry.
             print(f"[SESSION ERROR] {e}")
+            cached = _session_from_local_cache()
+            if cached is not None:
+                return cached
             return jsonify({
                 "error": "Temporary server error, please retry"
             }), 503
@@ -634,3 +753,33 @@ def current_user():
         "is_admin": is_admin_flag,
         "permissions": list(permissions),
     }), 200
+
+
+OFFLINE_CRED_MODULES = [
+    "birth_record", "archive_birth",
+    "death_record", "archive_death",
+    "marriage_record", "archive_marriage",
+]
+
+@login_bp.route('/api/offline-credentials', methods=['GET'])
+def offline_credentials():
+    """Return the bcrypt verifier for every module password so the device can
+    verify offline. Requires a logged-in session. Null = no password set."""
+    if not session.get('user_id'):
+        return jsonify({"error": "Not logged in."}), 401
+    try:
+        res = (supabase.table("module_passwords")
+               .select("module_key, password_hash")
+               .in_("module_key", OFFLINE_CRED_MODULES)
+               .execute())
+    except Exception as e:
+        print(f"[OFFLINE CREDS] {e}")
+        return jsonify({"error": "Temporary server error"}), 503
+    found = {r["module_key"]: r.get("password_hash") for r in (res.data or [])}
+    modules = {
+        m: (found[m] if found.get(m) and str(found[m]).startswith("$2") else None)
+        for m in OFFLINE_CRED_MODULES
+    }
+    resp = jsonify({"modules": modules})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, 200
