@@ -777,12 +777,29 @@ def _compute_growth_rate():
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════
 
+# Substrings that indicate the BACKEND cannot reach Supabase at all (DNS
+# failure, refused/reset connection, timeout). The frontend uses the 503 +
+# {"offline": true} response to fall back to its locally saved data.
+_OFFLINE_HINTS = (
+    "getaddrinfo", "11001", "name or service not known",
+    "temporary failure in name resolution", "connection refused",
+    "connection reset", "timed out", "max retries", "unreachable",
+)
+
+
+def _looks_offline(e):
+    msg = str(e).lower()
+    return any(h in msg for h in _OFFLINE_HINTS)
+
+
 def _cached_route(name, ttl, compute, label):
     """Shared wrapper: cache the computed result, return JSON, report errors."""
     try:
         return jsonify(cached(("agg", name), ttl, compute)), 200
     except Exception as e:
         print(f"[Analytics] /{label} error: {e}")
+        if _looks_offline(e):
+            return jsonify({"error": "Database unreachable", "offline": True}), 503
         return jsonify({"error": str(e)}), 500
 
 

@@ -8,7 +8,9 @@ from datetime import timedelta, datetime, timezone
 from flask import Flask, session, jsonify, request
 from flask_cors import CORS
 from flask_compress import Compress
-
+from routes.sync import register_offline_replay
+from routes.offline_credentials import offline_credentials_bp
+import time
 try:
     from supabase_client import supabase
 except Exception as e:
@@ -114,7 +116,8 @@ if extra_origins:
 CORS(app,
      supports_credentials=True,
      origins=ALLOWED_ORIGINS,
-     allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Cache-Control', 'Pragma'],
+     allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Cache-Control', 'Pragma',
+                    'X-Offline-Op-Id', 'X-Offline-Created-At'],
      methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
      expose_headers=['Content-Type', 'Set-Cookie'],
      max_age=86400
@@ -124,10 +127,13 @@ CORS(app,
 # state-changing requests from browser origins that aren't in ALLOWED_ORIGINS.
 register_origin_check(app, ALLOWED_ORIGINS)
 
+# Offline replay: idempotency (X-Offline-Op-Id) + real timestamps (X-Offline-Created-At).
+register_offline_replay(app)
+
 app.config["DB"] = None
 app.config["DB_CONFIG"] = None
 app.config["SUPABASE"] = supabase
-
+app.register_blueprint(offline_credentials_bp)
 app.register_blueprint(login_bp)
 app.register_blueprint(changepass_bp)
 app.register_blueprint(birth_bp)
@@ -166,7 +172,27 @@ def index():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    return {"status": "healthy"}, 200
+    """Heartbeat used by the frontend's connectivityService.js.
+
+    Returns 200 whenever Flask answers, so the browser knows the server is
+    reachable. The 'db' field reports whether Supabase answered. A database
+    hiccup no longer makes the device look offline.
+    No login required and no data is returned."""
+    db_ok = False
+    for attempt in range(2):
+        try:
+            supabase.table("users").select("id").limit(1).execute()
+            db_ok = True
+            break
+        except Exception as e:
+            print(f"[HEALTH] Supabase check attempt {attempt + 1} failed: {e}", flush=True)
+            time.sleep(0.3)
+    return jsonify({
+        "ok": True,
+        "server": True,
+        "db": db_ok,
+        "status": "healthy" if db_ok else "degraded",
+    }), 200
 
 
 # NOTE: the temporary /api/test-session diagnostic endpoint has been removed.

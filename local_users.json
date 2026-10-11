@@ -1,0 +1,139 @@
+{
+  "admin": {
+    "id": 11,
+    "username": "admin",
+    "password": "scrypt:32768:8:1$PbgsIGTW5aXwZqOq$257b690b5877761bbe330c465b2c50d628ae193309de9405866039cdd5c7faec6911ed60c2c0850ae7b8d43290b3ad94a01c893d0ca3d9acaf374cb395f011e7",
+    "roles": [
+      "Administrator"
+    ],
+    "permissions": [
+      "*",
+      "audit_logs",
+      "birth_archive_uploader",
+      "birth_verification",
+      "change_password",
+      "dashboard",
+      "death_archive_uploader",
+      "death_verification",
+      "document_stage_civil_registrar",
+      "document_stage_posting_period",
+      "document_stage_records_division",
+      "document_stage_registration",
+      "document_stage_registry_number",
+      "document_stage_releasing",
+      "document_tracking",
+      "marriage_archive_uploader",
+      "marriage_verification",
+      "offline_sync",
+      "role_management",
+      "user_management"
+    ],
+    "saved_at": "2026-10-11T07:48:55.837274+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  },
+  "jamaica": {
+    "id": 25,
+    "username": "jamaica",
+    "password": "scrypt:32768:8:1$qZ8kwbmDLYfGLyNv$f656b522c947cb808f1991853589bd86b12bd4a536718c28b17de70afe4fdaa1f57c263473d399b86289937bc089754eaf8bc713684fe50bf187f142fa4b4cd7",
+    "roles": [
+      "Registration"
+    ],
+    "permissions": [
+      "change_password",
+      "dashboard",
+      "document_stage_registration",
+      "document_tracking"
+    ],
+    "saved_at": "2026-10-11T07:09:26.404410+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  },
+  "test1": {
+    "id": 31,
+    "username": "test1",
+    "password": "scrypt:32768:8:1$BsrdnLhMWZfFpcxt$d77bf6b2d5a6998a9208f3b5f5c92d0ecd8dc46b3291b41d63e02da569bf0d0550cc25d5cfac65ecd11cc2f48e3185cd0bfcbb4a032d67b0663b9270c12072d9",
+    "roles": [
+      "Birth Verifier"
+    ],
+    "permissions": [
+      "birth_archive_uploader",
+      "birth_verification",
+      "change_password",
+      "dashboard"
+    ],
+    "saved_at": "2026-10-11T08:09:41.876410+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  },
+  "test2": {
+    "id": 32,
+    "username": "test2",
+    "password": "scrypt:32768:8:1$VX8PN3nm4E1zFH2W$535ce8d700474f9b3b65f31c1280c7ec4a9757eb582765261bd40196c9b36209d210bfa3a56c25bf4e309bb125b543bbdcc3a3e3728daeb49c5347acc8b2d04b",
+    "roles": [
+      "Death Verifier"
+    ],
+    "permissions": [
+      "change_password",
+      "dashboard",
+      "death_archive_uploader",
+      "death_verification"
+    ],
+    "saved_at": "2026-10-11T08:10:05.861571+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  },
+  "test3": {
+    "id": 33,
+    "username": "test3",
+    "password": "scrypt:32768:8:1$JlNnWNaeFYYPKro8$de94e9ee6d0cdea30ef3319abc69850ece7876465c3b2142d3b23d0cf84871981429cf12bffd3615758058b11d73addc18835e5f46abc461ab7d1ba86e390802",
+    "roles": [
+      "Marriage Verifier"
+    ],
+    "permissions": [
+      "change_password",
+      "dashboard",
+      "marriage_archive_uploader",
+      "marriage_verification"
+    ],
+    "saved_at": "2026-10-11T06:59:17.537941+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  },
+  "paracuelles": {
+    "id": 24,
+    "username": "paracuelles",
+    "password": "scrypt:32768:8:1$dzZ28brGHQfHDcP2$e7f0b3659108d2cb5b79635c08a135af9b70559658836c4ce8baedbdd2f388640a2af674b77c42160eb73743e5079426c2cebfd1074c8aac823a86da67684a3c",
+    "roles": [
+      "Assign Registry Number"
+    ],
+    "permissions": [
+      "change_password",
+      "dashboard",
+      "document_stage_registry_number",
+      "document_tracking",
+      "offline_sync"
+    ],
+    "saved_at": "2026-10-11T07:56:33.649889+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  },
+  "camoro": {
+    "id": 35,
+    "username": "camoro",
+    "password": "scrypt:32768:8:1$yAVDPDawViPEOLY3$2a1d5739039b64545b1cbb7767f97b832aba528a914a044f12d77fcb36c23a90533ecede77dd270e465fff5d01205a9b0a17dc7cf4f67edf1b5c6511b562bcb4",
+    "roles": [
+      "Registration"
+    ],
+    "permissions": [
+      "change_password",
+      "dashboard",
+      "document_stage_registration",
+      "document_tracking",
+      "offline_sync"
+    ],
+    "saved_at": "2026-10-11T08:15:11.635403+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  }
+}

@@ -9,7 +9,7 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request, send_file, session
+from flask import Blueprint, jsonify, request, send_file, session, g, has_request_context
 from werkzeug.utils import secure_filename
 from pypdf import PdfReader
 from postgrest.exceptions import APIError
@@ -17,7 +17,7 @@ from postgrest.exceptions import APIError
 from supabase_client import supabase
 from routes.notification import push_notification
 from logs.Audits import record_action
-from security import login_required_hook, admin_required
+from security import login_required_hook, admin_required, entity_permission_hook
 
 
 # =============================================================================
@@ -30,6 +30,12 @@ from security import login_required_hook, admin_required
 # =============================================================================
 
 def now_ph() -> datetime:
+    # Replayed offline requests carry the time the user actually did it
+    # (set by routes/sync.py). Normal requests are unaffected.
+    if has_request_context():
+        offline_time = getattr(g, "offline_created_at", None)
+        if offline_time is not None:
+            return offline_time
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
 
 
@@ -1378,6 +1384,10 @@ def complete_transaction():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEW SINGLE RECORD (Birth)
+#
+# Background PDF prefetch (frontend, offline support) calls this with
+# ?prefetch=1. Those calls are NOT a user viewing the record, so they must
+# not write a VIEW audit entry (it would flood the audit log).
 # ─────────────────────────────────────────────────────────────────────────────
 
 @birth_bp.route('/api/birth/records/<int:record_id>', methods=['GET'])
@@ -1388,13 +1398,14 @@ def get_record(record_id):
             return jsonify({"error": "Record not found"}), 404
         record = rows[0]
 
-        record_action(
-            "VIEW",
-            f"Viewed birth record: '{record['file_name']}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": record['file_name']},
-            ip=request.remote_addr
-        )
+        if request.args.get("prefetch") != "1":
+            record_action(
+                "VIEW",
+                f"Viewed birth record: '{record['file_name']}'",
+                username=get_user(),
+                meta={"record_id": record_id, "file_name": record['file_name']},
+                ip=request.remote_addr
+            )
 
         if record.get('pdf_data') is None:
             return jsonify({"error": "No PDF data found for this record."}), 404
@@ -3126,5 +3137,10 @@ def get_payments():
 # app.py registers the blueprints.)
 # =============================================================================
 
-for _bp in (death_bp, birth_bp, marriage_bp):
+for _bp, _entity in (
+    (death_bp,    "death"),
+    (birth_bp,    "birth"),
+    (marriage_bp, "marriage"),
+):
     _bp.before_request(login_required_hook)
+    _bp.before_request(entity_permission_hook(_entity))
