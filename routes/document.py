@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Bump this when the response shape changes. Shown in the X-Document-Api
 # response header so you can confirm which code is running.
-DOCUMENT_API_VERSION = "archive-v2"
+DOCUMENT_API_VERSION = "handled-v1"
 
 
 @document_bp.errorhandler(Exception)
@@ -79,6 +79,7 @@ STAGE_PERMISSION_KEYS = [
 #   ALTER TABLE document_stages ADD COLUMN IF NOT EXISTS assigned_handler_id
 #     integer REFERENCES document_personnel(id);
 #   ALTER TABLE documents ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+#   ALTER TABLE document_stages ADD COLUMN IF NOT EXISTS completed_by text;
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -438,6 +439,21 @@ def _doc_is_assigned_to(active_info, role_holders, username):
     return bool(holder) and holder.lower() == username.lower()
 
 
+def _handled_by_user(stages, username):
+    """
+    True when this username completed at least one stage of the document.
+    Keeps a document visible to the personnel who worked on it, even after
+    the active step has moved on to someone else.
+    """
+    if not username:
+        return False
+    target = username.lower()
+    return any(
+        (s.get("completed_by") or "").lower() == target
+        for s in (stages or [])
+    )
+
+
 def _summarize_document(row, handler_names):
     """Shapes a raw documents row into the shape the frontend expects."""
     handler_id = row.get("assigned_handler_id")
@@ -460,6 +476,7 @@ def _summarize_document(row, handler_names):
         "rejected": bool(row.get("rejected")),
         "archived": bool(archived_at),
         "archived_at": archived_at,
+        "handled_by_me": False,
         "updated_at": row.get("updated_at") or row.get("created_at"),
     }
 
@@ -607,6 +624,11 @@ def delete_handler(handler_id):
 
 @document_bp.route("", methods=["GET"])
 def list_documents():
+    """
+    Administrators see every active (or archived) document. Other users see
+    documents whose ACTIVE step they hold, plus documents they have completed
+    a step on, so their own work stays visible after the step moves on.
+    """
     err = require_login()
     if err:
         return err
@@ -662,12 +684,15 @@ def list_documents():
                 doc["active_stage"] = info["stage_label"]
             else:
                 doc["active_stage"] = None
+            doc["handled_by_me"] = _handled_by_user(stages_by_doc.get(doc["id"], []), username)
 
-        # Non-admins only see active documents whose current step they handle.
+        # Non-admins: active documents whose current step they hold, or that
+        # they have already worked on.
         if not admin:
             documents = [
                 d for d in documents
-                if _doc_is_assigned_to(active.get(d["id"]), role_holders, username)
+                if d["handled_by_me"]
+                or _doc_is_assigned_to(active.get(d["id"]), role_holders, username)
             ]
 
         logger.info(
@@ -836,6 +861,7 @@ def get_document_detail(document_id):
             s["comments"] = comments_by_stage.get(s["id"], [])
 
         document["stages"] = stages
+        document["handled_by_me"] = _handled_by_user(stages, current_username())
         document["registry_number"] = next(
             (s.get("registry_number") for s in stages
              if _is_registry_number_stage(s) and s.get("registry_number")),
@@ -919,8 +945,7 @@ def restore_document(document_id):
 def delete_document(document_id):
     """
     Admin-only. Permanently removes an ARCHIVED document. Child rows
-    (stages, comments, assignments) are removed by ON DELETE CASCADE, so
-    this is one lookup plus one delete instead of five round trips.
+    (stages, comments, assignments) are removed by ON DELETE CASCADE.
     """
     err = require_login()
     if err:
@@ -1107,7 +1132,7 @@ def complete_stage(document_id, stage_order):
     Marks the active stage complete. Enforced in order: document not archived,
     current active stage only, registry number, release destination, and for
     Late Registration documents only: posting period started and elapsed, plus
-    at least one comment.
+    at least one comment. Records who completed the stage in completed_by.
     """
     err = require_login()
     if err:
@@ -1157,7 +1182,12 @@ def complete_stage(document_id, stage_order):
 
     execute_with_retry(
         supabase.table("document_stages")
-        .update({"done": True, "flag": False, "completed_at": "now()"})
+        .update({
+            "done": True,
+            "flag": False,
+            "completed_at": "now()",
+            "completed_by": current_username(),
+        })
         .eq("id", stage["id"])
     )
     return jsonify({"ok": True})
