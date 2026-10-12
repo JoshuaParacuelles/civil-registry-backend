@@ -13,9 +13,9 @@ document_bp = Blueprint("document", __name__, url_prefix="/api/documents")
 
 logger = logging.getLogger(__name__)
 
-# Bump this when the list response shape changes. Shown in the
-# X-Document-Api response header so you can confirm which code is running.
-DOCUMENT_API_VERSION = "assigned-v3"
+# Bump this when the response shape changes. Shown in the X-Document-Api
+# response header so you can confirm which code is running.
+DOCUMENT_API_VERSION = "archive-v1"
 
 
 @document_bp.errorhandler(Exception)
@@ -80,6 +80,7 @@ STAGE_PERMISSION_KEYS = [
 #   ALTER TABLE document_stages ADD COLUMN IF NOT EXISTS posting_end_at timestamptz;
 #   ALTER TABLE document_stages ADD COLUMN IF NOT EXISTS assigned_handler_id
 #     integer REFERENCES document_personnel(id);
+#   ALTER TABLE documents ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -148,6 +149,27 @@ def block_if_admin():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Archive guard
+# ─────────────────────────────────────────────────────────────────────────
+
+def _document_is_archived(document_id):
+    res = execute_with_retry(
+        supabase.table("documents").select("archived_at").eq("id", document_id).limit(1)
+    )
+    return bool(res.data and res.data[0].get("archived_at"))
+
+
+def block_if_archived(document_id):
+    """Archived documents are paused: no stage actions until restored."""
+    if document_id is not None and _document_is_archived(document_id):
+        audit_denial("Stage action attempted on an archived document")
+        return jsonify({
+            "error": "This document is in the archive. Restore it before continuing."
+        }), 409
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Stage permission mapping
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -174,10 +196,14 @@ def _stage_permission_for_label(label):
 
 def block_if_no_stage_permission(stage):
     """
-    Returns an error response tuple if the current user's role does not carry
-    the document_stage_* permission for this stage, else None. A "*" permission
-    passes every stage.
+    Returns an error response tuple if the document is archived, or if the
+    current user's role does not carry the document_stage_* permission for
+    this stage. A "*" permission passes every stage.
     """
+    err = block_if_archived(stage.get("document_id"))
+    if err:
+        return err
+
     required_permission = _stage_permission_for_label(stage.get("label"))
     if not required_permission:
         return None
@@ -428,6 +454,7 @@ def _summarize_document(row, handler_names):
     status = STATUS_LABELS.get(raw_status, raw_status) or (
         "Rejected" if row.get("rejected") else "In review"
     )
+    archived_at = row.get("archived_at")
     return {
         "id": row.get("id"),
         "doc_number": row.get("doc_number"),
@@ -439,6 +466,8 @@ def _summarize_document(row, handler_names):
         "deleted_handler_id": deleted_handler_id,
         "deleted_handler_name": handler_names.get(deleted_handler_id) if deleted_handler_id else None,
         "rejected": bool(row.get("rejected")),
+        "archived": bool(archived_at),
+        "archived_at": archived_at,
         "updated_at": row.get("updated_at") or row.get("created_at"),
     }
 
@@ -582,7 +611,7 @@ def delete_handler(handler_id):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Documents: list, create, detail, delete
+# Documents: list, create, detail, archive, restore, permanent delete
 # ─────────────────────────────────────────────────────────────────────────
 
 @document_bp.route("", methods=["GET"])
@@ -592,6 +621,14 @@ def list_documents():
         return err
 
     username = current_username()
+    admin = is_admin(username)
+    want_archived = request.args.get("archived", "").lower() == "true"
+
+    # Only administrators can see the archive.
+    if want_archived and not admin:
+        response = jsonify([])
+        response.headers["X-Document-Api"] = DOCUMENT_API_VERSION
+        return response
 
     try:
         res = execute_with_retry(
@@ -605,16 +642,17 @@ def list_documents():
     if rows is None:
         return jsonify({"error": "Could not load documents from the database"}), 500
 
+    # Split active vs. archived on archived_at so each list is always correct.
+    rows = [r for r in rows if bool(r.get("archived_at")) == want_archived]
+
     try:
         doc_ids = [r.get("id") for r in rows]
 
-        # Document-level names (kept for deleted-handler info and fallback).
         handler_ids = []
         for r in rows:
             handler_ids.append(r.get("assigned_handler_id"))
             handler_ids.append(r.get("deleted_handler_id"))
 
-        # Stage-level data, loaded once for the whole list.
         stages_by_doc = _fetch_stages_for_documents(doc_ids)
         for stages in stages_by_doc.values():
             for s in stages:
@@ -625,7 +663,6 @@ def list_documents():
 
         documents = [_summarize_document(r, personnel_names) for r in rows]
 
-        # Show who handles the ACTIVE stage, not the old document-level handler.
         active = _active_stage_summaries(stages_by_doc, personnel_names, role_holders)
         for doc in documents:
             info = active.get(doc["id"])
@@ -633,21 +670,18 @@ def list_documents():
                 doc["owner"] = info["handler_name"] or "Unassigned"
                 doc["active_stage"] = info["stage_label"]
             else:
-                # Every stage done (or no stages): keep the document-level owner.
                 doc["active_stage"] = None
 
-        # Non-admins only see documents whose current step they handle.
-        if not is_admin(username):
+        # Non-admins only see active documents whose current step they handle.
+        if not admin:
             documents = [
                 d for d in documents
                 if _doc_is_assigned_to(active.get(d["id"]), role_holders, username)
             ]
 
         logger.info(
-            "documents list for %s: %d rows, %d with an active stage",
-            username,
-            len(documents),
-            sum(1 for d in documents if d.get("active_stage")),
+            "documents list for %s (archived=%s): %d rows",
+            username, want_archived, len(documents),
         )
     except Exception as e:
         logger.exception("Failed to shape document rows")
@@ -769,9 +803,6 @@ def get_document_detail(document_id):
             ).data or []
         )
 
-        # Personnel names for each stage's own assigned_handler_id, plus the
-        # role-based holders. Both resolved through the shared helper so the
-        # detail view and the list always agree.
         stage_handler_names = _handler_names([s.get("assigned_handler_id") for s in stages])
         role_holders = _get_stage_handler_usernames(STAGE_PERMISSION_KEYS)
 
@@ -831,9 +862,71 @@ def get_document_detail(document_id):
     return jsonify(document)
 
 
+@document_bp.route("/<int:document_id>/archive", methods=["POST"])
+def archive_document(document_id):
+    """Admin-only. Moves a document to the archive and pauses its processing."""
+    err = require_login()
+    if err:
+        return err
+    err = require_admin()
+    if err:
+        return err
+
+    try:
+        res = execute_with_retry(
+            supabase.table("documents").select("id, archived_at").eq("id", document_id).limit(1)
+        )
+        if not res.data:
+            return jsonify({"error": "Document not found"}), 404
+        if res.data[0].get("archived_at"):
+            return jsonify({"error": "This document is already in the archive"}), 409
+
+        execute_with_retry(
+            supabase.table("documents")
+            .update({"archived_at": "now()"})
+            .eq("id", document_id)
+        )
+    except Exception as e:
+        logger.exception("Failed to archive document %s", document_id)
+        return jsonify({"error": f"Could not archive this document: {e}"}), 500
+
+    return jsonify({"ok": True})
+
+
+@document_bp.route("/<int:document_id>/restore", methods=["POST"])
+def restore_document(document_id):
+    """Admin-only. Brings an archived document back to the active list."""
+    err = require_login()
+    if err:
+        return err
+    err = require_admin()
+    if err:
+        return err
+
+    try:
+        res = execute_with_retry(
+            supabase.table("documents").select("id, archived_at").eq("id", document_id).limit(1)
+        )
+        if not res.data:
+            return jsonify({"error": "Document not found"}), 404
+        if not res.data[0].get("archived_at"):
+            return jsonify({"error": "This document is not in the archive"}), 409
+
+        execute_with_retry(
+            supabase.table("documents")
+            .update({"archived_at": None})
+            .eq("id", document_id)
+        )
+    except Exception as e:
+        logger.exception("Failed to restore document %s", document_id)
+        return jsonify({"error": f"Could not restore this document: {e}"}), 500
+
+    return jsonify({"ok": True})
+
+
 @document_bp.route("/<int:document_id>", methods=["DELETE"])
 def delete_document(document_id):
-    """Admin-only. Removes the document and its child rows."""
+    """Admin-only. Permanently removes an ARCHIVED document and its child rows."""
     err = require_login()
     if err:
         return err
@@ -843,7 +936,10 @@ def delete_document(document_id):
 
     try:
         existing = execute_with_retry(
-            supabase.table("documents").select("id").eq("id", document_id).limit(1)
+            supabase.table("documents")
+            .select("id, archived_at")
+            .eq("id", document_id)
+            .limit(1)
         )
     except Exception as e:
         logger.exception("Failed to look up document %s for deletion", document_id)
@@ -851,6 +947,11 @@ def delete_document(document_id):
 
     if not existing.data:
         return jsonify({"error": "Document not found"}), 404
+
+    if not existing.data[0].get("archived_at"):
+        return jsonify({
+            "error": "Move the document to the archive before deleting it permanently."
+        }), 409
 
     try:
         execute_with_retry(supabase.table("document_comments").delete().eq("document_id", document_id))
@@ -1016,10 +1117,10 @@ def assign_stage_handler(document_id, stage_order):
 @document_bp.route("/<int:document_id>/stages/<int:stage_order>/complete", methods=["POST"])
 def complete_stage(document_id, stage_order):
     """
-    Marks the active stage complete. Enforced in order: current active stage
-    only, registry number (Assign Registry Number), release destination
-    (Releasing), and for Late Registration documents only: posting period
-    started and elapsed, plus at least one comment.
+    Marks the active stage complete. Enforced in order: document not archived,
+    current active stage only, registry number (Assign Registry Number), release
+    destination (Releasing), and for Late Registration documents only: posting
+    period started and elapsed, plus at least one comment.
     """
     err = require_login()
     if err:
@@ -1236,6 +1337,12 @@ def reject_document(document_id):
     if err:
         return err
 
+    # Archived documents cannot be rejected. Checked here because a document
+    # with no active stage would otherwise skip the stage permission check.
+    err = block_if_archived(document_id)
+    if err:
+        return err
+
     active_stage = _get_active_stage(document_id)
     if active_stage:
         err = block_if_no_stage_permission(active_stage)
@@ -1283,5 +1390,6 @@ def add_comment(document_id, stage_order):
         })
     )
     return jsonify(res.data[0] if res.data else {"ok": True})
+
 
 document_bp.before_request(entity_permission_hook("tracking"))
