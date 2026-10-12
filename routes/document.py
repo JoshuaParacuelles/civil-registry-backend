@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Bump this when the response shape changes. Shown in the X-Document-Api
 # response header so you can confirm which code is running.
-DOCUMENT_API_VERSION = "archive-v1"
+DOCUMENT_API_VERSION = "archive-v2"
 
 
 @document_bp.errorhandler(Exception)
@@ -24,8 +24,7 @@ def _handle_document_bp_error(e):
     if isinstance(e, HTTPException):
         return e
     # Anything else is almost always the database being unreachable or a
-    # query failing outright. Return a clear 503 instead of a generic 500
-    # so the frontend can show a meaningful message.
+    # query failing outright. Return a clear 503 instead of a generic 500.
     logger.exception("Unhandled error in Document Tracking route")
     return jsonify({
         "error": "Server or database unavailable. Please try again when the connection returns.",
@@ -33,8 +32,7 @@ def _handle_document_bp_error(e):
 
 
 # Substrings that identify a *transient* socket hiccup rather than a
-# real database/query problem (e.g. Windows "WinError 10035" when two
-# requests race to use the shared supabase httpx client).
+# real database/query problem.
 _TRANSIENT_ERROR_MARKERS = ("10035", "WinError", "WSAEWOULDBLOCK", "temporarily unavailable")
 
 # How many days a document must remain posted before the "Posting Period"
@@ -139,8 +137,7 @@ def require_admin():
 def block_if_admin():
     """
     Returns an error response tuple if the current user IS an admin, else None.
-    Administrators are strictly view-only on working a document: they never
-    complete, flag, reject, or comment on a stage themselves.
+    Administrators are strictly view-only on working a document.
     """
     if is_admin(current_username()):
         audit_denial("Administrators are view-only for document processing")
@@ -243,8 +240,7 @@ def _get_stage_handler_usernames(permissions):
     """
     Resolves {permission: username} for every requested stage permission in
     ONE query over user_roles. Skips the Administrator role and the reserved
-    "admin" account. Only Document Tracking Credentials (category="document")
-    are considered where that column exists.
+    "admin" account.
     """
     permissions = {p for p in permissions if p}
     if not permissions:
@@ -387,11 +383,9 @@ def _resolve_stage_handler_name(stage, personnel_names, role_holders):
     """
     The single source of truth for "who is handling this stage".
     Priority:
-      1. A user whose role carries this stage's document_stage_* permission
-         (Document Tracking Credentials).
+      1. A user whose role carries this stage's document_stage_* permission.
       2. The personnel assigned to this stage (stage.assigned_handler_id).
       3. None (rendered as "Unassigned" / "Unsigned" by the caller).
-    Used by BOTH the list and the detail view so they never disagree.
     """
     permission = _stage_permission_for_label(stage.get("label"))
     role_username = role_holders.get(permission) if permission else None
@@ -421,7 +415,6 @@ def _active_stage_summaries(stages_by_doc, personnel_names, role_holders):
     """
     For each document, returns the active stage and the name of whoever
     handles it. Documents with every stage done are not included.
-    Returns {document_id: {"stage_label": str, "handler_name": str | None}}.
     """
     summary = {}
     for doc_id, stages in stages_by_doc.items():
@@ -437,8 +430,7 @@ def _active_stage_summaries(stages_by_doc, personnel_names, role_holders):
 
 
 def _doc_is_assigned_to(active_info, role_holders, username):
-    """True when this username holds the role for the document's active step
-    (the same person shown as "Currently handling" on that step)."""
+    """True when this username holds the role for the document's active step."""
     if not active_info or not username:
         return False
     permission = _stage_permission_for_label(active_info.get("stage_label"))
@@ -500,8 +492,7 @@ def list_handlers():
 def list_stage_holders():
     """
     {permission: username} for every stage role currently assigned in
-    Role Management (Document Tracking Credentials). Saved on the device
-    so stage names still show when offline.
+    Role Management (Document Tracking Credentials).
     """
     err = require_login()
     if err:
@@ -926,7 +917,11 @@ def restore_document(document_id):
 
 @document_bp.route("/<int:document_id>", methods=["DELETE"])
 def delete_document(document_id):
-    """Admin-only. Permanently removes an ARCHIVED document and its child rows."""
+    """
+    Admin-only. Permanently removes an ARCHIVED document. Child rows
+    (stages, comments, assignments) are removed by ON DELETE CASCADE, so
+    this is one lookup plus one delete instead of five round trips.
+    """
     err = require_login()
     if err:
         return err
@@ -935,29 +930,22 @@ def delete_document(document_id):
         return err
 
     try:
-        existing = execute_with_retry(
+        res = execute_with_retry(
             supabase.table("documents")
             .select("id, archived_at")
             .eq("id", document_id)
             .limit(1)
         )
-    except Exception as e:
-        logger.exception("Failed to look up document %s for deletion", document_id)
-        return jsonify({"error": f"Database error while looking up this document: {e}"}), 500
+        if not res.data:
+            return jsonify({"error": "Document not found"}), 404
+        if not res.data[0].get("archived_at"):
+            return jsonify({
+                "error": "Move the document to the archive before deleting it permanently."
+            }), 409
 
-    if not existing.data:
-        return jsonify({"error": "Document not found"}), 404
-
-    if not existing.data[0].get("archived_at"):
-        return jsonify({
-            "error": "Move the document to the archive before deleting it permanently."
-        }), 409
-
-    try:
-        execute_with_retry(supabase.table("document_comments").delete().eq("document_id", document_id))
-        execute_with_retry(supabase.table("document_assignments").delete().eq("document_id", document_id))
-        execute_with_retry(supabase.table("document_stages").delete().eq("document_id", document_id))
-        execute_with_retry(supabase.table("documents").delete().eq("id", document_id))
+        execute_with_retry(
+            supabase.table("documents").delete().eq("id", document_id)
+        )
     except Exception as e:
         logger.exception("Failed to delete document %s", document_id)
         return jsonify({"error": f"Could not delete this document: {e}"}), 500
@@ -973,8 +961,7 @@ def delete_document(document_id):
 def assign_handler(document_id):
     """
     Admin-only. Once any stage is done, reassignment is refused, except for a
-    document left unassigned by a personnel deletion. A soft-deleted person is
-    only assignable as this document's own deleted_handler_id.
+    document left unassigned by a personnel deletion.
     """
     err = require_login()
     if err:
@@ -1118,9 +1105,9 @@ def assign_stage_handler(document_id, stage_order):
 def complete_stage(document_id, stage_order):
     """
     Marks the active stage complete. Enforced in order: document not archived,
-    current active stage only, registry number (Assign Registry Number), release
-    destination (Releasing), and for Late Registration documents only: posting
-    period started and elapsed, plus at least one comment.
+    current active stage only, registry number, release destination, and for
+    Late Registration documents only: posting period started and elapsed, plus
+    at least one comment.
     """
     err = require_login()
     if err:
