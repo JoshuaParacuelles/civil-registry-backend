@@ -1,13 +1,15 @@
-import logging
-import time
 import json
+import logging
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, g, jsonify, request, session
 from werkzeug.exceptions import HTTPException
-from supabase_client import supabase
-from auth.Rolemanagement import is_admin, get_user_permissions
+
+from auth.Rolemanagement import get_user_permissions, is_admin
 from security import audit_denial, entity_permission_hook
+from supabase_client import supabase
 
 document_bp = Blueprint("document", __name__, url_prefix="/api/documents")
 
@@ -15,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Bump this when the response shape changes. Shown in the X-Document-Api
 # response header so you can confirm which code is running.
-DOCUMENT_API_VERSION = "handled-v1"
+DOCUMENT_API_VERSION = "handled-v2"
 
 
 @document_bp.errorhandler(Exception)
@@ -66,6 +68,10 @@ STAGE_PERMISSION_KEYS = [
     "document_stage_releasing",
 ]
 
+# How long the stage-holder map (role -> username) is cached. Role changes
+# can also clear it immediately with invalidate_stage_holder_cache().
+STAGE_HOLDER_CACHE_SECONDS = 60
+
 # ─────────────────────────────────────────────────────────────────────────
 # Required schema (run once in Supabase before deploying):
 #
@@ -80,6 +86,12 @@ STAGE_PERMISSION_KEYS = [
 #     integer REFERENCES document_personnel(id);
 #   ALTER TABLE documents ADD COLUMN IF NOT EXISTS archived_at timestamptz;
 #   ALTER TABLE document_stages ADD COLUMN IF NOT EXISTS completed_by text;
+#
+# Recommended indexes:
+#
+#   CREATE INDEX IF NOT EXISTS idx_stages_doc_order ON document_stages (document_id, stage_order);
+#   CREATE INDEX IF NOT EXISTS idx_comments_stage ON document_comments (stage_id);
+#   CREATE INDEX IF NOT EXISTS idx_documents_archived ON documents (archived_at);
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -101,10 +113,6 @@ def execute_with_retry(query_builder, attempts=3, base_delay=0.2):
     raise last_err
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────
-
 # Maps the lowercase Postgres enum values in documents.status to the
 # labels the frontend expects.
 STATUS_LABELS = {
@@ -113,6 +121,18 @@ STATUS_LABELS = {
     "changes_requested": "Changes requested",
     "rejected": "Rejected",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Per-request cache and auth helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+def _request_cached(key, factory):
+    """Runs factory() at most once per HTTP request and returns its result."""
+    cache = g.setdefault("_document_request_cache", {})
+    if key not in cache:
+        cache[key] = factory()
+    return cache[key]
 
 
 def current_username():
@@ -127,9 +147,38 @@ def require_login():
     return None
 
 
+def _current_is_admin():
+    return _request_cached("is_admin", lambda: bool(is_admin(current_username())))
+
+
+def _current_permissions():
+    return _request_cached(
+        "permissions",
+        lambda: set(get_user_permissions(current_username()) or []),
+    )
+
+
+def _current_user_row():
+    """The current user's row from `users` (one query per request at most)."""
+    def load():
+        res = execute_with_retry(
+            supabase.table("users")
+            .select("id, full_name, username")
+            .eq("username", current_username())
+            .limit(1)
+        )
+        return res.data[0] if res.data else None
+    return _request_cached("user_row", load)
+
+
+def _current_author_name():
+    row = _current_user_row() or {}
+    return row.get("full_name") or row.get("username") or current_username() or "Unknown"
+
+
 def require_admin():
     """Returns an error response tuple if the current user is NOT an admin, else None."""
-    if not is_admin(current_username()):
+    if not _current_is_admin():
         audit_denial("Document Tracking admin privileges required")
         return jsonify({"error": "Admin access required"}), 403
     return None
@@ -140,30 +189,9 @@ def block_if_admin():
     Returns an error response tuple if the current user IS an admin, else None.
     Administrators are strictly view-only on working a document.
     """
-    if is_admin(current_username()):
+    if _current_is_admin():
         audit_denial("Administrators are view-only for document processing")
         return jsonify({"error": "Admins have view-only access to Document Tracking"}), 403
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Archive guard
-# ─────────────────────────────────────────────────────────────────────────
-
-def _document_is_archived(document_id):
-    res = execute_with_retry(
-        supabase.table("documents").select("archived_at").eq("id", document_id).limit(1)
-    )
-    return bool(res.data and res.data[0].get("archived_at"))
-
-
-def block_if_archived(document_id):
-    """Archived documents are paused: no stage actions until restored."""
-    if document_id is not None and _document_is_archived(document_id):
-        audit_denial("Stage action attempted on an archived document")
-        return jsonify({
-            "error": "This document is in the archive. Restore it before continuing."
-        }), 409
     return None
 
 
@@ -192,29 +220,22 @@ def _stage_permission_for_label(label):
     return None
 
 
-def block_if_no_stage_permission(stage):
+def _check_stage_permission(stage):
     """
-    Returns an error response tuple if the document is archived, or if the
-    current user's role does not carry the document_stage_* permission for
-    this stage. A "*" permission passes every stage.
+    Returns an error response tuple if the current user's role does not carry
+    the document_stage_* permission for this stage, else None. A "*"
+    permission passes every stage.
     """
-    err = block_if_archived(stage.get("document_id"))
-    if err:
-        return err
-
-    required_permission = _stage_permission_for_label(stage.get("label"))
-    if not required_permission:
+    required = _stage_permission_for_label(stage.get("label"))
+    if not required:
         return None
-    perms = get_user_permissions(current_username())
-    if "*" in perms or required_permission in perms:
+    perms = _current_permissions()
+    if "*" in perms or required in perms:
         return None
     audit_denial("Required document stage permission missing")
-    return (
-        jsonify({
-            "error": "Access denied — your role does not include this Document Tracking stage"
-        }),
-        403,
-    )
+    return jsonify({
+        "error": "Access denied — your role does not include this Document Tracking stage"
+    }), 403
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -222,6 +243,8 @@ def block_if_no_stage_permission(stage):
 # ─────────────────────────────────────────────────────────────────────────
 
 _DOC_CATEGORY_COLUMN_OK = None
+_stage_holder_cache = {"value": None, "expires": 0.0}
+_stage_holder_lock = threading.Lock()
 
 
 def _document_category_column_available():
@@ -237,27 +260,21 @@ def _document_category_column_available():
     return _DOC_CATEGORY_COLUMN_OK
 
 
-def _get_stage_handler_usernames(permissions):
+def _load_stage_handler_usernames():
     """
-    Resolves {permission: username} for every requested stage permission in
-    ONE query over user_roles. Skips the Administrator role and the reserved
-    "admin" account.
+    Resolves {permission: username} for every stage permission in ONE query
+    over user_roles. Skips the Administrator role and the reserved "admin"
+    account. Raises on database errors so failures are never cached.
     """
-    permissions = {p for p in permissions if p}
-    if not permissions:
-        return {}
-    try:
-        query = supabase.table("user_roles").select("username, roles(name, permissions)")
-        if _document_category_column_available():
-            query = query.eq("category", "document")
-        res = execute_with_retry(query)
-    except Exception:
-        logger.exception("Failed to resolve role-based handlers for permissions %s", permissions)
-        return {}
+    wanted = set(STAGE_PERMISSION_KEYS)
+    query = supabase.table("user_roles").select("username, roles(name, permissions)")
+    if _document_category_column_available():
+        query = query.eq("category", "document")
+    res = execute_with_retry(query)
 
     result = {}
     for row in (res.data or []):
-        if len(result) == len(permissions):
+        if len(result) == len(wanted):
             break
         role = row.get("roles")
         if isinstance(role, list):
@@ -277,37 +294,39 @@ def _get_stage_handler_usernames(permissions):
                 raw_perms = []
         if not raw_perms:
             continue
-        for permission in permissions:
-            if permission in result:
-                continue
-            if permission in raw_perms:
+        for permission in wanted:
+            if permission not in result and permission in raw_perms:
                 result[permission] = username
     return result
+
+
+def _stage_holder_map():
+    """{permission: username} for all stage permissions, cached briefly."""
+    now = time.monotonic()
+    with _stage_holder_lock:
+        if _stage_holder_cache["value"] is not None and now < _stage_holder_cache["expires"]:
+            return _stage_holder_cache["value"]
+    try:
+        value = _load_stage_handler_usernames()
+    except Exception:
+        logger.exception("Failed to resolve role-based stage handlers")
+        return {}
+    with _stage_holder_lock:
+        _stage_holder_cache["value"] = value
+        _stage_holder_cache["expires"] = time.monotonic() + STAGE_HOLDER_CACHE_SECONDS
+    return value
+
+
+def invalidate_stage_holder_cache():
+    """Call after roles change in Role Management so the new holders show at once."""
+    with _stage_holder_lock:
+        _stage_holder_cache["value"] = None
+        _stage_holder_cache["expires"] = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────
-
-def get_user_id(username):
-    """Resolves a username to its users.id (used for author/owner/assigned_by)."""
-    res = execute_with_retry(
-        supabase.table("users").select("id").eq("username", username).limit(1)
-    )
-    return res.data[0]["id"] if res.data else None
-
-
-def get_stage(document_id, stage_order):
-    """Fetches a single stage row by (document_id, stage_order), or None."""
-    res = execute_with_retry(
-        supabase.table("document_stages")
-        .select("*")
-        .eq("document_id", document_id)
-        .eq("stage_order", stage_order)
-        .limit(1)
-    )
-    return res.data[0] if res.data else None
-
 
 def _document_has_progress(document_id):
     """True if any stage of this document is already done."""
@@ -322,20 +341,6 @@ def _is_active_stage(stage):
     return (not stage.get("done")) or bool(stage.get("flag"))
 
 
-def _get_active_stage(document_id):
-    """Returns the first stage that is neither done nor flagged, or None."""
-    res = execute_with_retry(
-        supabase.table("document_stages")
-        .select("*")
-        .eq("document_id", document_id)
-        .order("stage_order")
-    )
-    for s in (res.data or []):
-        if _is_active_stage(s):
-            return s
-    return None
-
-
 def _is_registry_number_stage(stage):
     return "registry number" in (stage.get("label") or "").lower()
 
@@ -348,22 +353,19 @@ def _is_posting_period_stage(stage):
     return (stage.get("label") or "").strip().lower() == "posting period"
 
 
-def _document_is_late_registration(document_id):
-    """
-    True when the document's doc_type mentions "late registration". Only
-    those documents require the Posting Period window and comment.
-    """
+def _is_late_registration(doc):
+    """True when the document's doc_type mentions "late registration"."""
+    return "late registration" in (doc.get("doc_type") or "").strip().lower()
+
+
+def _parse_timestamp(value):
     try:
-        res = execute_with_retry(
-            supabase.table("documents").select("doc_type").eq("id", document_id).limit(1)
-        )
-    except Exception:
-        logger.exception("Failed to check doc_type for document %s", document_id)
-        return False
-    if not res.data:
-        return False
-    doc_type = (res.data[0].get("doc_type") or "").strip().lower()
-    return "late registration" in doc_type
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _handler_names(handler_ids):
@@ -395,6 +397,17 @@ def _resolve_stage_handler_name(stage, personnel_names, role_holders):
     return personnel_names.get(stage.get("assigned_handler_id"))
 
 
+def _fetch_stages(document_id):
+    """Loads every stage of one document in ONE query, ordered."""
+    res = execute_with_retry(
+        supabase.table("document_stages")
+        .select("*")
+        .eq("document_id", document_id)
+        .order("stage_order")
+    )
+    return res.data or []
+
+
 def _fetch_stages_for_documents(document_ids):
     """Loads every stage for the given documents in ONE query, ordered."""
     document_ids = [d for d in set(document_ids) if d is not None]
@@ -410,6 +423,98 @@ def _fetch_stages_for_documents(document_ids):
     for s in (res.data or []):
         by_doc.setdefault(s.get("document_id"), []).append(s)
     return by_doc
+
+
+def _load_document_context(document_id):
+    """
+    Two queries total: the document row and its stages.
+    Returns (document_row | None, stages, active_stage | None).
+    """
+    doc_res = execute_with_retry(
+        supabase.table("documents").select("*").eq("id", document_id).limit(1)
+    )
+    if not doc_res.data:
+        return None, [], None
+    stages = _fetch_stages(document_id)
+    active = next((s for s in stages if _is_active_stage(s)), None)
+    return doc_res.data[0], stages, active
+
+
+def _authorize_stage_action(document_id, stage_order, require_active=False):
+    """
+    Shared guard for stage actions: login, not admin, document exists and is
+    not archived, stage exists, role carries the stage permission, and (when
+    required) the stage is the active one.
+
+    Returns (error_response, context). On error, context is None.
+    context = {"doc": row, "stages": [...], "active": stage | None, "stage": stage}
+    """
+    err = require_login()
+    if err:
+        return err, None
+    err = block_if_admin()
+    if err:
+        return err, None
+
+    doc, stages, active = _load_document_context(document_id)
+    if not doc:
+        return (jsonify({"error": "Document not found"}), 404), None
+    if doc.get("archived_at"):
+        audit_denial("Stage action attempted on an archived document")
+        return (jsonify({
+            "error": "This document is in the archive. Restore it before continuing."
+        }), 409), None
+
+    stage = next((s for s in stages if s.get("stage_order") == stage_order), None)
+    if not stage:
+        return (jsonify({"error": "Stage not found"}), 404), None
+
+    err = _check_stage_permission(stage)
+    if err:
+        return err, None
+
+    if require_active and (not active or active.get("stage_order") != stage_order):
+        return (jsonify({"error": "This step is not the current active step."}), 409), None
+
+    return None, {"doc": doc, "stages": stages, "active": active, "stage": stage}
+
+
+def _shape_comment(row, author):
+    return {
+        "id": row.get("id"),
+        "document_id": row.get("document_id"),
+        "stage_id": row.get("stage_id"),
+        "author": author,
+        "body": row.get("body"),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _summarize_document(row, handler_names):
+    """Shapes a raw documents row into the shape the frontend expects."""
+    handler_id = row.get("assigned_handler_id")
+    deleted_handler_id = row.get("deleted_handler_id")
+    raw_status = row.get("status")
+    status = STATUS_LABELS.get(raw_status, raw_status) or (
+        "Rejected" if row.get("rejected") else "In review"
+    )
+    archived_at = row.get("archived_at")
+    return {
+        "id": row.get("id"),
+        "doc_number": row.get("doc_number"),
+        "title": row.get("title") or row.get("name") or "Untitled document",
+        "type": row.get("doc_type") or row.get("type") or "—",
+        "status": status,
+        "owner": handler_names.get(handler_id, "Unassigned"),
+        "assigned_handler_id": handler_id,
+        "deleted_handler_id": deleted_handler_id,
+        "deleted_handler_name": handler_names.get(deleted_handler_id) if deleted_handler_id else None,
+        "rejected": bool(row.get("rejected")),
+        "archived": bool(archived_at),
+        "archived_at": archived_at,
+        "handled_by_me": False,
+        "updated_at": row.get("updated_at") or row.get("created_at"),
+    }
 
 
 def _active_stage_summaries(stages_by_doc, personnel_names, role_holders):
@@ -448,37 +553,7 @@ def _handled_by_user(stages, username):
     if not username:
         return False
     target = username.lower()
-    return any(
-        (s.get("completed_by") or "").lower() == target
-        for s in (stages or [])
-    )
-
-
-def _summarize_document(row, handler_names):
-    """Shapes a raw documents row into the shape the frontend expects."""
-    handler_id = row.get("assigned_handler_id")
-    deleted_handler_id = row.get("deleted_handler_id")
-    raw_status = row.get("status")
-    status = STATUS_LABELS.get(raw_status, raw_status) or (
-        "Rejected" if row.get("rejected") else "In review"
-    )
-    archived_at = row.get("archived_at")
-    return {
-        "id": row.get("id"),
-        "doc_number": row.get("doc_number"),
-        "title": row.get("title") or row.get("name") or "Untitled document",
-        "type": row.get("doc_type") or row.get("type") or "—",
-        "status": status,
-        "owner": handler_names.get(handler_id, "Unassigned"),
-        "assigned_handler_id": handler_id,
-        "deleted_handler_id": deleted_handler_id,
-        "deleted_handler_name": handler_names.get(deleted_handler_id) if deleted_handler_id else None,
-        "rejected": bool(row.get("rejected")),
-        "archived": bool(archived_at),
-        "archived_at": archived_at,
-        "handled_by_me": False,
-        "updated_at": row.get("updated_at") or row.get("created_at"),
-    }
+    return any((s.get("completed_by") or "").lower() == target for s in (stages or []))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -514,7 +589,7 @@ def list_stage_holders():
     err = require_login()
     if err:
         return err
-    return jsonify(_get_stage_handler_usernames(STAGE_PERMISSION_KEYS))
+    return jsonify(_stage_holder_map())
 
 
 @document_bp.route("/handlers", methods=["POST"])
@@ -588,16 +663,11 @@ def delete_handler(handler_id):
         return jsonify({"error": "Person not found"}), 404
 
     try:
-        affected = execute_with_retry(
-            supabase.table("documents").select("id").eq("assigned_handler_id", handler_id)
+        execute_with_retry(
+            supabase.table("documents")
+            .update({"assigned_handler_id": None, "deleted_handler_id": handler_id})
+            .eq("assigned_handler_id", handler_id)
         )
-        if affected.data:
-            execute_with_retry(
-                supabase.table("documents")
-                .update({"assigned_handler_id": None, "deleted_handler_id": handler_id})
-                .eq("assigned_handler_id", handler_id)
-            )
-
         execute_with_retry(
             supabase.table("document_stages")
             .update({"assigned_handler_id": None})
@@ -634,7 +704,7 @@ def list_documents():
         return err
 
     username = current_username()
-    admin = is_admin(username)
+    admin = _current_is_admin()
     want_archived = request.args.get("archived", "").lower() == "true"
 
     # Only administrators can see the archive.
@@ -659,20 +729,18 @@ def list_documents():
     rows = [r for r in rows if bool(r.get("archived_at")) == want_archived]
 
     try:
-        doc_ids = [r.get("id") for r in rows]
+        stages_by_doc = _fetch_stages_for_documents([r.get("id") for r in rows])
 
-        handler_ids = []
+        name_ids = []
         for r in rows:
-            handler_ids.append(r.get("assigned_handler_id"))
-            handler_ids.append(r.get("deleted_handler_id"))
-
-        stages_by_doc = _fetch_stages_for_documents(doc_ids)
+            name_ids.append(r.get("assigned_handler_id"))
+            name_ids.append(r.get("deleted_handler_id"))
         for stages in stages_by_doc.values():
             for s in stages:
-                handler_ids.append(s.get("assigned_handler_id"))
+                name_ids.append(s.get("assigned_handler_id"))
 
-        personnel_names = _handler_names(handler_ids)
-        role_holders = _get_stage_handler_usernames(STAGE_PERMISSION_KEYS)
+        personnel_names = _handler_names(name_ids)
+        role_holders = _stage_holder_map()
 
         documents = [_summarize_document(r, personnel_names) for r in rows]
 
@@ -730,8 +798,8 @@ def create_document():
     if not doc_number:
         return jsonify({"error": "Document number is required"}), 400
 
-    owner_id = get_user_id(current_username())
-    if not owner_id:
+    me = _current_user_row()
+    if not me:
         return jsonify({"error": "Current user record not found"}), 400
 
     try:
@@ -747,7 +815,7 @@ def create_document():
                 "doc_number": doc_number,
                 "title": title,
                 "doc_type": doc_type,
-                "owner_id": owner_id,
+                "owner_id": me["id"],
                 "assigned_handler_id": None,
             })
             .select("*")
@@ -782,7 +850,9 @@ def create_document():
             "warning": f"Document created, but starter stages could not be added: {e}",
         }), 201
 
-    return jsonify(_summarize_document(new_doc, {})), 201
+    response = jsonify(_summarize_document(new_doc, {}))
+    response.headers["X-Document-Api"] = DOCUMENT_API_VERSION
+    return response, 201
 
 
 @document_bp.route("/<int:document_id>", methods=["GET"])
@@ -807,27 +877,7 @@ def get_document_detail(document_id):
     row = doc_res.data[0]
 
     try:
-        handler_names = _handler_names([row.get("assigned_handler_id"), row.get("deleted_handler_id")])
-        document = _summarize_document(row, handler_names)
-
-        stages = (
-            execute_with_retry(
-                supabase.table("document_stages")
-                .select("*")
-                .eq("document_id", document_id)
-                .order("stage_order")
-            ).data or []
-        )
-
-        stage_handler_names = _handler_names([s.get("assigned_handler_id") for s in stages])
-        role_holders = _get_stage_handler_usernames(STAGE_PERMISSION_KEYS)
-
-        for s in stages:
-            stage_handler_id = s.get("assigned_handler_id")
-            s["assigned_handler_id"] = stage_handler_id
-            s["assigned_handler_name"] = _resolve_stage_handler_name(
-                s, stage_handler_names, role_holders
-            )
+        stages = _fetch_stages(document_id)
 
         comments = (
             execute_with_retry(
@@ -838,28 +888,36 @@ def get_document_detail(document_id):
             ).data or []
         )
 
-        author_ids = list({c["author_id"] for c in comments})
+        author_ids = list({c["author_id"] for c in comments if c.get("author_id") is not None})
         authors = {}
         if author_ids:
             users_res = execute_with_retry(
                 supabase.table("users").select("id, full_name, username").in_("id", author_ids)
             )
             authors = {
-                u["id"]: (u.get("full_name") or u["username"]) for u in (users_res.data or [])
+                u["id"]: (u.get("full_name") or u.get("username"))
+                for u in (users_res.data or [])
             }
 
         comments_by_stage = {}
         for c in comments:
             comments_by_stage.setdefault(c["stage_id"], []).append({
                 "id": c["id"],
-                "author": authors.get(c["author_id"], "Unknown"),
-                "body": c["body"],
-                "created_at": c["created_at"],
+                "author": authors.get(c.get("author_id"), "Unknown"),
+                "body": c.get("body"),
+                "created_at": c.get("created_at"),
             })
 
+        name_ids = [row.get("assigned_handler_id"), row.get("deleted_handler_id")]
+        name_ids += [s.get("assigned_handler_id") for s in stages]
+        names = _handler_names(name_ids)
+        role_holders = _stage_holder_map()
+
         for s in stages:
+            s["assigned_handler_name"] = _resolve_stage_handler_name(s, names, role_holders)
             s["comments"] = comments_by_stage.get(s["id"], [])
 
+        document = _summarize_document(row, names)
         document["stages"] = stages
         document["handled_by_me"] = _handled_by_user(stages, current_username())
         document["registry_number"] = next(
@@ -876,7 +934,9 @@ def get_document_detail(document_id):
         logger.exception("Failed to assemble document detail for %s", document_id)
         return jsonify({"error": f"Server error while loading this document: {e}"}), 500
 
-    return jsonify(document)
+    response = jsonify(document)
+    response.headers["X-Document-Api"] = DOCUMENT_API_VERSION
+    return response
 
 
 @document_bp.route("/<int:document_id>/archive", methods=["POST"])
@@ -1042,8 +1102,8 @@ def assign_handler(document_id):
             if not doc_row or doc_row.get("deleted_handler_id") != handler_id:
                 return jsonify({"error": "That person isn't in the handler pool"}), 400
 
-        assigned_by_id = get_user_id(current_username())
-        if not assigned_by_id:
+        me = _current_user_row()
+        if not me:
             return jsonify({"error": "Current user record not found"}), 400
 
         execute_with_retry(
@@ -1055,7 +1115,7 @@ def assign_handler(document_id):
             supabase.table("document_assignments").insert({
                 "document_id": document_id,
                 "handler_id": handler_id,
-                "assigned_by_id": assigned_by_id,
+                "assigned_by_id": me["id"],
                 "note": note,
             })
         )
@@ -1079,9 +1139,20 @@ def assign_stage_handler(document_id, stage_order):
     body = request.get_json(silent=True) or {}
     handler_id = body.get("handler_id")
 
-    stage = get_stage(document_id, stage_order)
-    if not stage:
+    try:
+        stage_res = execute_with_retry(
+            supabase.table("document_stages")
+            .select("id")
+            .eq("document_id", document_id)
+            .eq("stage_order", stage_order)
+            .limit(1)
+        )
+    except Exception as e:
+        logger.exception("Failed to load stage %s of document %s", stage_order, document_id)
+        return jsonify({"error": f"Database error while loading this step: {e}"}), 500
+    if not stage_res.data:
         return jsonify({"error": "Stage not found"}), 404
+    stage_id = stage_res.data[0]["id"]
 
     if handler_id in (None, "", 0, "0"):
         handler_id = None
@@ -1108,7 +1179,7 @@ def assign_stage_handler(document_id, stage_order):
         execute_with_retry(
             supabase.table("document_stages")
             .update({"assigned_handler_id": handler_id})
-            .eq("id", stage["id"])
+            .eq("id", stage_id)
         )
     except Exception as e:
         logger.exception("Failed to assign stage handler for document %s stage %s", document_id, stage_order)
@@ -1129,29 +1200,16 @@ def assign_stage_handler(document_id, stage_order):
 @document_bp.route("/<int:document_id>/stages/<int:stage_order>/complete", methods=["POST"])
 def complete_stage(document_id, stage_order):
     """
-    Marks the active stage complete. Enforced in order: document not archived,
-    current active stage only, registry number, release destination, and for
-    Late Registration documents only: posting period started and elapsed, plus
-    at least one comment. Records who completed the stage in completed_by.
+    Marks the active stage complete. Checks run in memory on data loaded
+    once: archive, permission, active step, registry number, release
+    destination, and for Late Registration documents only: posting period
+    started and elapsed, plus at least one comment.
     """
-    err = require_login()
-    if err:
-        return err
-    err = block_if_admin()
+    err, ctx = _authorize_stage_action(document_id, stage_order, require_active=True)
     if err:
         return err
 
-    stage = get_stage(document_id, stage_order)
-    if not stage:
-        return jsonify({"error": "Stage not found"}), 404
-
-    err = block_if_no_stage_permission(stage)
-    if err:
-        return err
-
-    active_stage = _get_active_stage(document_id)
-    if not active_stage or active_stage.get("stage_order") != stage_order:
-        return jsonify({"error": "This step is not the current active step."}), 409
+    doc, stage = ctx["doc"], ctx["stage"]
 
     if _is_registry_number_stage(stage) and not (stage.get("registry_number") or "").strip():
         return jsonify({"error": "Enter and save the Registry Number before completing this step."}), 409
@@ -1159,28 +1217,26 @@ def complete_stage(document_id, stage_order):
     if _is_releasing_stage(stage) and not (stage.get("release_destination") or "").strip():
         return jsonify({"error": "Select the release destination before completing this step."}), 409
 
-    if _is_posting_period_stage(stage) and _document_is_late_registration(document_id):
+    if _is_posting_period_stage(stage) and _is_late_registration(doc):
         posting_start_at = stage.get("posting_start_at")
         posting_end_at = stage.get("posting_end_at")
         if not posting_start_at or not posting_end_at:
             return jsonify({"error": "Start the posting period before completing this step."}), 409
-        try:
-            end_dt = datetime.fromisoformat(str(posting_end_at).replace("Z", "+00:00"))
-            if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            end_dt = None
+
+        end_dt = _parse_timestamp(posting_end_at)
         if end_dt is None or datetime.now(timezone.utc) < end_dt:
             return jsonify({
                 "error": f"The {POSTING_PERIOD_DAYS}-day posting period has not elapsed yet."
             }), 409
+
         comment_check = execute_with_retry(
             supabase.table("document_comments").select("id").eq("stage_id", stage["id"]).limit(1)
         )
         if not comment_check.data:
             return jsonify({"error": "Add a comment on this step before completing it."}), 409
 
-    execute_with_retry(
+    # done=False in the filter means a double-submit cannot complete twice.
+    res = execute_with_retry(
         supabase.table("document_stages")
         .update({
             "done": True,
@@ -1189,16 +1245,18 @@ def complete_stage(document_id, stage_order):
             "completed_by": current_username(),
         })
         .eq("id", stage["id"])
+        .eq("done", False)
+        .select("completed_at")
     )
-    return jsonify({"ok": True})
+    if not res.data:
+        return jsonify({"error": "This step has already been completed."}), 409
+
+    return jsonify({"ok": True, "completed_at": res.data[0].get("completed_at")})
 
 
 @document_bp.route("/<int:document_id>/stages/<int:stage_order>/registry-number", methods=["POST"])
 def save_registry_number(document_id, stage_order):
-    err = require_login()
-    if err:
-        return err
-    err = block_if_admin()
+    err, ctx = _authorize_stage_action(document_id, stage_order)
     if err:
         return err
 
@@ -1207,14 +1265,7 @@ def save_registry_number(document_id, stage_order):
     if not registry_number:
         return jsonify({"error": "Registry Number is required"}), 400
 
-    stage = get_stage(document_id, stage_order)
-    if not stage:
-        return jsonify({"error": "Stage not found"}), 404
-
-    err = block_if_no_stage_permission(stage)
-    if err:
-        return err
-
+    stage = ctx["stage"]
     if not _is_registry_number_stage(stage):
         return jsonify({"error": "This step does not accept a Registry Number"}), 400
 
@@ -1228,10 +1279,7 @@ def save_registry_number(document_id, stage_order):
 
 @document_bp.route("/<int:document_id>/stages/<int:stage_order>/release-destination", methods=["POST"])
 def save_release_destination(document_id, stage_order):
-    err = require_login()
-    if err:
-        return err
-    err = block_if_admin()
+    err, ctx = _authorize_stage_action(document_id, stage_order)
     if err:
         return err
 
@@ -1244,14 +1292,7 @@ def save_release_destination(document_id, stage_order):
             "error": "Release destination must be one of: " + ", ".join(RELEASE_DESTINATIONS)
         }), 400
 
-    stage = get_stage(document_id, stage_order)
-    if not stage:
-        return jsonify({"error": "Stage not found"}), 404
-
-    err = block_if_no_stage_permission(stage)
-    if err:
-        return err
-
+    stage = ctx["stage"]
     if not _is_releasing_stage(stage):
         return jsonify({"error": "This step does not accept a release destination"}), 400
 
@@ -1265,21 +1306,11 @@ def save_release_destination(document_id, stage_order):
 
 @document_bp.route("/<int:document_id>/stages/<int:stage_order>/posting-period", methods=["POST"])
 def start_posting_period(document_id, stage_order):
-    err = require_login()
-    if err:
-        return err
-    err = block_if_admin()
+    err, ctx = _authorize_stage_action(document_id, stage_order)
     if err:
         return err
 
-    stage = get_stage(document_id, stage_order)
-    if not stage:
-        return jsonify({"error": "Stage not found"}), 404
-
-    err = block_if_no_stage_permission(stage)
-    if err:
-        return err
-
+    stage = ctx["stage"]
     if not _is_posting_period_stage(stage):
         return jsonify({"error": "This step does not accept a posting period"}), 400
     if stage.get("posting_start_at"):
@@ -1288,14 +1319,20 @@ def start_posting_period(document_id, stage_order):
     start_at = datetime.now(timezone.utc)
     end_at = start_at + timedelta(days=POSTING_PERIOD_DAYS)
 
-    execute_with_retry(
+    # The is_null filter means two simultaneous starts cannot both succeed.
+    res = execute_with_retry(
         supabase.table("document_stages")
         .update({
             "posting_start_at": start_at.isoformat(),
             "posting_end_at": end_at.isoformat(),
         })
         .eq("id", stage["id"])
+        .is_("posting_start_at", "null")
+        .select("id")
     )
+    if not res.data:
+        return jsonify({"error": "The posting period has already been started for this step"}), 409
+
     return jsonify({
         "ok": True,
         "posting_start_at": start_at.isoformat(),
@@ -1305,10 +1342,7 @@ def start_posting_period(document_id, stage_order):
 
 @document_bp.route("/<int:document_id>/stages/<int:stage_order>/flag", methods=["POST"])
 def flag_stage(document_id, stage_order):
-    err = require_login()
-    if err:
-        return err
-    err = block_if_admin()
+    err, ctx = _authorize_stage_action(document_id, stage_order)
     if err:
         return err
 
@@ -1317,16 +1351,10 @@ def flag_stage(document_id, stage_order):
     if not note:
         return jsonify({"error": "A note explaining what needs to change is required"}), 400
 
-    stage = get_stage(document_id, stage_order)
-    if not stage:
-        return jsonify({"error": "Stage not found"}), 404
-
-    err = block_if_no_stage_permission(stage)
-    if err:
-        return err
-
-    author_id = get_user_id(current_username())
-    if not author_id:
+    stage = ctx["stage"]
+    author = _current_author_name()
+    author_id = (_current_user_row() or {}).get("id")
+    if author_id is None:
         return jsonify({"error": "Current user record not found"}), 400
 
     execute_with_retry(
@@ -1334,15 +1362,16 @@ def flag_stage(document_id, stage_order):
         .update({"flag": True, "done": False, "completed_at": "now()"})
         .eq("id", stage["id"])
     )
-    execute_with_retry(
+    res = execute_with_retry(
         supabase.table("document_comments").insert({
             "document_id": document_id,
             "stage_id": stage["id"],
             "author_id": author_id,
             "body": note,
-        })
+        }).select("*")
     )
-    return jsonify({"ok": True})
+    row = res.data[0] if res.data else {"body": note}
+    return jsonify({"ok": True, "comment": _shape_comment(row, author)})
 
 
 @document_bp.route("/<int:document_id>/reject", methods=["POST"])
@@ -1354,15 +1383,16 @@ def reject_document(document_id):
     if err:
         return err
 
-    # Archived documents cannot be rejected. Checked here because a document
-    # with no active stage would otherwise skip the stage permission check.
-    err = block_if_archived(document_id)
-    if err:
-        return err
+    doc, stages, active = _load_document_context(document_id)
+    if not doc:
+        return jsonify({"error": "Document not found"}), 404
+    if doc.get("archived_at"):
+        return jsonify({
+            "error": "This document is in the archive. Restore it before continuing."
+        }), 409
 
-    active_stage = _get_active_stage(document_id)
-    if active_stage:
-        err = block_if_no_stage_permission(active_stage)
+    if active:
+        err = _check_stage_permission(active)
         if err:
             return err
 
@@ -1374,10 +1404,7 @@ def reject_document(document_id):
 
 @document_bp.route("/<int:document_id>/stages/<int:stage_order>/comments", methods=["POST"])
 def add_comment(document_id, stage_order):
-    err = require_login()
-    if err:
-        return err
-    err = block_if_admin()
+    err, ctx = _authorize_stage_action(document_id, stage_order)
     if err:
         return err
 
@@ -1386,16 +1413,10 @@ def add_comment(document_id, stage_order):
     if not text:
         return jsonify({"error": "Comment body is required"}), 400
 
-    stage = get_stage(document_id, stage_order)
-    if not stage:
-        return jsonify({"error": "Stage not found"}), 404
-
-    err = block_if_no_stage_permission(stage)
-    if err:
-        return err
-
-    author_id = get_user_id(current_username())
-    if not author_id:
+    stage = ctx["stage"]
+    author = _current_author_name()
+    author_id = (_current_user_row() or {}).get("id")
+    if author_id is None:
         return jsonify({"error": "Current user record not found"}), 400
 
     res = execute_with_retry(
@@ -1404,9 +1425,10 @@ def add_comment(document_id, stage_order):
             "stage_id": stage["id"],
             "author_id": author_id,
             "body": text,
-        })
+        }).select("*")
     )
-    return jsonify(res.data[0] if res.data else {"ok": True})
+    row = res.data[0] if res.data else {"body": text}
+    return jsonify(_shape_comment(row, author)), 201
 
 
 document_bp.before_request(entity_permission_hook("tracking"))
