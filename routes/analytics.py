@@ -171,7 +171,12 @@ def cached(key, ttl, loader, max_stale=MAX_STALE_SECONDS):
 
 
 def invalidate_analytics_cache(record_table=None):
-    """Drop cached analytics data after a successful record or payment write."""
+    """
+    Drop cached analytics data.
+    - No argument: clears everything (used by the /refresh endpoint).
+    - record_table given: clears that table's raw/count caches plus all
+      aggregates (aggregates depend on every table).
+    """
     with _CACHE_GUARD:
         for key in list(_CACHE):
             if (
@@ -884,3 +889,17 @@ def debug_counts():
     except Exception as e:
         print(f"[Analytics] /debug-counts error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@analytics_bp.route("/api/analytics/refresh", methods=["POST"])
+def refresh_cache():
+    """
+    Clears the worker-local analytics cache so the next dashboard fetch
+    reads fresh data. Protected by _require_login (before_request).
+    """
+    try:
+        invalidate_analytics_cache()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        print(f"[Analytics] /refresh error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500

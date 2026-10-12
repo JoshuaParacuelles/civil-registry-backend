@@ -16,6 +16,7 @@ from postgrest.exceptions import APIError
 
 from supabase_client import supabase
 from routes.notification import push_notification
+from routes.analytics import invalidate_analytics_cache  # analytics cache
 from logs.Audits import record_action
 from security import login_required_hook, admin_required, entity_permission_hook
 
@@ -456,6 +457,7 @@ def upload_record():
             return jsonify({"error": "Failed to insert record."}), 500
 
         record_id = res.data[0]["id"]
+        invalidate_analytics_cache("death_records")  # analytics cache
 
         fetch_res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS).eq("id", record_id).single().execute()
         return jsonify(fetch_res.data), 201
@@ -565,6 +567,7 @@ def delete_record(record_id: int):
         res = supabase.table("death_records").delete().eq("id", record_id).execute()
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
+        invalidate_analytics_cache("death_records")  # analytics cache
         return jsonify({"success": True, "message": "Record deleted permanently."}), 200
     except Exception as e:
         return jsonify({"error": f"Failed to delete record: {str(e)}"}), 500
@@ -618,6 +621,7 @@ def complete_transaction():
             "last_name": last_name,
             "created_at": now_dt().isoformat()
         }).execute()
+        invalidate_analytics_cache("death_records")  # analytics cache
 
         # NOTIFICATION: only when the record was FOUND and it matches an
         # online request (see _matches_online_death_request()).
@@ -1198,6 +1202,7 @@ def upload_record():
             raise
 
         record_id = resp.data[0]["id"] if resp.data else None
+        invalidate_analytics_cache("birth_records")  # analytics cache
 
         # No notification on upload — notifications fire only when a
         # matching record is found and a transaction is completed.
@@ -1331,6 +1336,7 @@ def complete_transaction():
             "payment_date": payment_date.isoformat(), "processed_by": processed_by,
         }).execute()
         payment_id = resp.data[0]["id"] if resp.data else None
+        invalidate_analytics_cache("birth_records")  # analytics cache
 
         # NOTIFICATION: only when the record was FOUND and it matches an
         # online request (see _matches_online_birth_request()).
@@ -1569,6 +1575,7 @@ def delete_record(record_id):
         file_name = rows[0]['file_name']
 
         supabase.table("birth_records").delete().eq("id", record_id).execute()
+        invalidate_analytics_cache("birth_records")  # analytics cache
 
         record_action(
             "DELETE",
@@ -1684,6 +1691,7 @@ def create_payment():
             "payment_date": payment_date.isoformat(), "processed_by": processed_by,
         }).execute()
         payment_id = resp.data[0]["id"] if resp.data else None
+        invalidate_analytics_cache("birth_records")  # analytics cache
 
         # NOTIFICATION: only when a matching record exists (positive) AND it
         # matches an online request (see _matches_online_birth_request()).
@@ -2687,6 +2695,7 @@ def _delete_record(record_id):
 
         paths = _paths_for_row(row)
         supabase.table("marriage_records").delete().eq("id", record_id).execute()
+        invalidate_analytics_cache("marriage_records")  # analytics cache
 
         leftover = [os.path.basename(p) for p in paths if not _safe_remove(p)]
 
@@ -2772,6 +2781,7 @@ def _upload_pdf(target="archive"):
 
         tmp_path = None
         new_row  = res.data[0]
+        invalidate_analytics_cache("marriage_records")  # analytics cache
 
         # No notification on upload — notifications fire only when a
         # matching record is found and a certificate is issued.
@@ -3049,6 +3059,7 @@ def complete_transaction():
         if not insert_res.data:
             return jsonify({"error": "Failed to save transaction."}), 500
         transaction_id = insert_res.data[0]["id"]
+        invalidate_analytics_cache("marriage_records")  # analytics cache
 
         # NOTIFICATION: only when the record was FOUND and it matches an
         # online request (see _matches_online_marriage_request()).
