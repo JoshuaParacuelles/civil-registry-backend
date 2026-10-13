@@ -27,6 +27,60 @@ _ROUTE_ID_KEYS = (
     "record_id", "document_id", "payment_id", "role_id", "handler_id", "id",
 )
 
+# Roles allowed to read the audit log. Must match the role names in Rolemanagement.py.
+AUDIT_VIEWER_ROLES = {"Administrator", "Auditor"}
+
+# Keep these names in sync with the actions the routes actually record.
+# The frontend groups the action filter by these categories.
+AUDIT_ACTION_CATALOG = {
+    "Authentication": ["LOGIN_SUCCESS", "LOGIN_FAILED", "ACCOUNT_LOCKED", "LOGOUT", "SESSION_EXPIRED"],
+    "Documents": ["BIRTH_RECORD_VIEWED", "MARRIAGE_RECORD_VIEWED", "DEATH_RECORD_VIEWED",
+                  "BIRTH_PDF_UPLOADED", "MARRIAGE_PDF_UPLOADED", "DEATH_PDF_UPLOADED",
+                  "PDF_VIEWED", "PDF_DOWNLOADED"],
+    "Document Tracking": ["DOCUMENT_CREATED", "DOCUMENT_ASSIGNED", "DOCUMENT_ARCHIVED",
+                          "DOCUMENT_RESTORED", "DOCUMENT_REJECTED", "DOCUMENT_COMMENT_ADDED",
+                          "DOCUMENT_DELETED_PERMANENTLY"],
+    "Registration Workflow": ["DOCUMENT_STEP_UPDATED", "DOCUMENT_STEP_ASSIGNED",
+                              "REGISTRY_NUMBER_ASSIGNED", "DOCUMENT_RELEASED"],
+    "Personnel": ["PERSONNEL_ADDED", "PERSONNEL_REMOVED"],
+    "Roles": ["ROLE_CREATED", "ROLE_UPDATED", "ROLE_DELETED"],
+    "Accounts": ["ACCOUNT_UPDATED", "PASSWORD_CHANGED"],
+    "Audit": ["AUDIT_LOG_VIEWED", "AUDIT_LOG_EXPORTED", "AUDIT_ACCESS_DENIED", "ACCESS_DENIED"],
+}
+
+
+def _current_role():
+    return session.get("role") or ("Administrator" if session.get("is_admin") else None)
+
+
+def mark_denial_logged():
+    """Tell the generic 401/403 hook in app.py that this request's denial is
+    already in the audit log, so it is not recorded a second time."""
+    if has_request_context():
+        g._denial_logged = True
+
+
+def require_audit_viewer(fn):
+    """Allow read-only audit access to admins and auditors. Denials are logged here,
+    because an outer 403 would never reach audit_action."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("username"):
+            return jsonify({"error": "Not logged in"}), 401
+        if session.get("is_admin") or _current_role() in AUDIT_VIEWER_ROLES:
+            return fn(*args, **kwargs)
+        mark_denial_logged()
+        record_action(
+            "AUDIT_ACCESS_DENIED",
+            "Denied access to audit logs",
+            status="DENIED",
+            resource_type="audit_log",
+            resource_id=request.path,
+            meta={"route": request.path, "method": request.method},
+        )
+        return jsonify({"error": "Forbidden"}), 403
+    return wrapper
+
 
 def init_audit_db():
     """No-op: audit_logs table is created via Supabase SQL Editor, not here."""
@@ -99,7 +153,9 @@ def scrub_sensitive(value, key=None):
         return mask_email(value)
     if key_text == "tin":
         return mask_identifier(value)
-    if any(token in key_text for token in ("nationalid", "passport", "identitynumber", "registryno")):
+    if any(token in key_text for token in (
+        "nationalid", "passport", "identitynumber", "registryno", "registrynumber",
+    )):
         return mask_identifier(value)
     if (
         key_text.endswith("name")
@@ -145,6 +201,22 @@ def _request_identity(username=None, user_id=None, role=None, ip=None, user_agen
     return username, user_id, role, ip, user_agent
 
 
+def _parse_occurred_at(value):
+    """Accept a device-supplied ISO timestamp. Reject unparseable values and
+    timestamps more than 5 minutes in the future."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed > datetime.now(timezone.utc) + timedelta(minutes=5):
+        return None
+    return parsed.isoformat()
+
+
 def record_action(
     action,
     description,
@@ -160,8 +232,13 @@ def record_action(
     user_agent=None,
     old_value=None,
     new_value=None,
+    occurred_at=None,
 ):
-    """Insert a server-side audit entry; preserves the legacy first 5 arguments."""
+    """Insert a server-side audit entry; preserves the legacy first 5 arguments.
+
+    `occurred_at` is the device-side time for offline actions. `created_at` is
+    always the server receive time and is what ordering and pagination use.
+    """
     try:
         username, user_id, role, ip, user_agent = _request_identity(
             username, user_id, role, ip, user_agent
@@ -171,24 +248,63 @@ def record_action(
             status = "FAILED"
 
         supabase.table("audit_logs").insert({
-            "username":    username or "System",
-            "user_id":     user_id,
-            "role":        role,
-            "action":      action,
-            "description": description,
-            "meta":        json.dumps(scrub_sensitive(meta), default=str) if meta is not None else None,
-            "ip_address":  ip,
-            "status":      status,
+            "username":      username or "System",
+            "user_id":       user_id,
+            "role":          role,
+            "action":        action,
+            "description":   description,
+            "meta":          json.dumps(scrub_sensitive(meta), default=str) if meta is not None else None,
+            "ip_address":    ip,
+            "status":        status,
             "resource_type": resource_type,
-            "resource_id": str(resource_id) if resource_id is not None else None,
-            "user_agent":  user_agent,
-            "old_value":   scrub_sensitive(old_value) if old_value is not None else None,
-            "new_value":   scrub_sensitive(new_value) if new_value is not None else None,
-            "created_at":  datetime.now(timezone.utc).isoformat(),
+            "resource_id":   str(resource_id) if resource_id is not None else None,
+            "user_agent":    user_agent,
+            "old_value":     scrub_sensitive(old_value) if old_value is not None else None,
+            "new_value":     scrub_sensitive(new_value) if new_value is not None else None,
+            "occurred_at":   _parse_occurred_at(occurred_at),
+            "created_at":    datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception as e:
         _logger.exception("[AUDIT RECORD ERROR] %s", e)
         print(f"[AUDIT RECORD ERROR] {e}", flush=True)
+
+
+def record_document_event(
+    action,
+    document_id,
+    description,
+    *,
+    step=None,
+    old_status=None,
+    new_status=None,
+    handled_by=None,
+    document_type=None,
+    status="SUCCESS",
+    extra_meta=None,
+):
+    """Audit a document tracking or registration event.
+
+    Records the document by ID, never by file path, title, or applicant details.
+    Staff names in `handled_by` are kept so auditors can see who handled each
+    step. `step` is the workflow stage label, e.g. "Civil Registrar".
+    """
+    record_action(
+        action,
+        description,
+        status=status,
+        resource_type="document",
+        resource_id=document_id,
+        old_value={"status": old_status} if old_status is not None else None,
+        new_value={
+            "step": step,
+            "status": new_status,
+            "handled_by": handled_by,
+        },
+        meta={
+            "document_type": document_type,
+            **(extra_meta or {}),
+        },
+    )
 
 
 def set_audit_context(*, old_value=None, new_value=None, resource_id=None, meta=None, status=None):
@@ -274,6 +390,8 @@ def audit_action(action, resource_type=None, description=None, dedupe_window_sec
                     )
                 ):
                     return result
+                if event_status == "DENIED":
+                    mark_denial_logged()
                 record_action(
                     action,
                     description or action.replace("_", " ").title(),
@@ -313,8 +431,14 @@ def _parse_iso_date(value, parameter):
         raise ValueError(f"{parameter} must be an ISO date (YYYY-MM-DD)") from exc
 
 
+@audit_bp.route("/api/audit/actions", methods=["GET"])
+@require_audit_viewer
+def get_action_catalog():
+    return jsonify({"categories": AUDIT_ACTION_CATALOG})
+
+
 @audit_bp.route("/api/audit/history", methods=["GET"])
-@require_admin
+@require_audit_viewer
 @audit_action("AUDIT_LOG_VIEWED", resource_type="audit_log", dedupe_window_seconds=300)
 def get_history():
     limit = max(1, min(request.args.get("limit", 100, type=int), 200))
@@ -350,7 +474,8 @@ def get_history():
     try:
         query = supabase.table("audit_logs").select(
             "id, username, user_id, role, action, description, meta, ip_address, "
-            "status, resource_type, resource_id, old_value, new_value, user_agent, created_at",
+            "status, resource_type, resource_id, old_value, new_value, user_agent, "
+            "created_at, occurred_at",
             count="exact",
         )
 
@@ -402,13 +527,13 @@ def get_history():
 
 
 @audit_bp.route("/api/audit/export-event", methods=["POST"])
-@require_admin
+@require_audit_viewer
 def audit_export_event():
-    """Record that an admin exported the audit log (the export itself is client-side)."""
+    """Record that a viewer exported the audit log (the export itself is client-side)."""
     body = request.get_json(silent=True) or {}
     filters = {
         key: str(body[key])[:100]
-        for key in ("action", "user", "status", "resource_type", "date_from", "date_to")
+        for key in ("action", "user", "search", "status", "resource_type", "date_from", "date_to")
         if body.get(key)
     }
     row_count = body.get("row_count")

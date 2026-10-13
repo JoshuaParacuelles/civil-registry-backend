@@ -5,7 +5,7 @@ load_dotenv()
 import os
 import sys
 from datetime import timedelta, datetime, timezone
-from flask import Flask, session, jsonify, request
+from flask import Flask, session, jsonify, request, g
 from flask_cors import CORS
 from flask_compress import Compress
 from routes.sync import register_offline_replay
@@ -22,7 +22,7 @@ except Exception as e:
     print("=" * 60)
     raise
 
-from security import audit_denial, register_origin_check
+from security import register_origin_check
 from auth.login import login_bp
 from auth.changepass import changepass_bp
 from routes.marriage_death_birth import birth_bp, death_bp, marriage_bp
@@ -34,7 +34,7 @@ from routes.citizen_requests import citizen_requests_bp
 from auth.birth_password import birth_archive_bp, init_birth_archive_db
 from auth.Death_password import death_archive_bp, init_death_archive_db
 from auth.marriage_password import marriage_auth_bp, init_marriage_archive_db
-from logs.Audits import audit_bp, init_audit_db
+from logs.Audits import audit_bp, init_audit_db, record_action, mark_denial_logged
 from auth.Rolemanagement import role_bp, init_roles_db
 
 app = Flask(__name__)
@@ -97,7 +97,13 @@ def enforce_session_expiry():
     now = datetime.now(timezone.utc).timestamp()
     ttl = session.get('ttl', 24 * 3600)
     if now - session.get('last_seen', now) > ttl:
-        audit_denial("Session expired due to inactivity", action="SESSION_EXPIRED")
+        # Written before session.clear(), while the identity is still available.
+        record_action(
+            "SESSION_EXPIRED",
+            "Session expired due to inactivity",
+            status="DENIED",
+            resource_type="session",
+        )
         session.clear()
         return
     session['last_seen'] = now
@@ -202,19 +208,34 @@ def health_check():
     }), 200
 
 
-# NOTE: the temporary /api/test-session diagnostic endpoint has been removed.
-# It was reachable without logging in and exposed server internals.
-
-
 @app.after_request
 def log_unauthorized(resp):
-    """Print one line to the Render logs for every 401, so the cause is visible
-    there too (cookie missing vs. cookie present but no username in it)."""
-    if resp.status_code in (401, 403):
-        audit_denial(
+    """Generic audit entry for 401/403 responses that no route guard has
+    already recorded. Guards that log their own denial call
+    mark_denial_logged() first, so each refused request yields one row.
+
+    A 401 with no logged-in user is not audited (it is usually an anonymous
+    probe and would flood the table). A 401 from a session that was logged in
+    is recorded."""
+    if resp.status_code == 403 and not g.get("_denial_logged"):
+        record_action(
+            "ACCESS_DENIED",
             "Request denied by authentication or authorization check",
-            action="ACCESS_DENIED",
+            status="DENIED",
+            resource_type="route",
+            resource_id=request.path,
+            meta={"route": request.path, "method": request.method},
         )
+    elif resp.status_code == 401 and not g.get("_denial_logged") and session.get("username"):
+        record_action(
+            "ACCESS_DENIED",
+            "Session rejected by authentication check",
+            status="DENIED",
+            resource_type="route",
+            resource_id=request.path,
+            meta={"route": request.path, "method": request.method},
+        )
+
     if resp.status_code == 401:
         cookie_name = app.config.get('SESSION_COOKIE_NAME', 'session')
         print(
