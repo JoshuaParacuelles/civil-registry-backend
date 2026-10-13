@@ -53,6 +53,12 @@ IS_PRODUCTION = (
     or bool(os.environ.get('RENDER'))
 )
 
+# Set by electron/main.cjs when the desktop app starts this backend. The
+# Electron app runs on app://civil-registry (cross-site to http://127.0.0.1),
+# so the session cookie must be SameSite=None; Secure, the same as production.
+ELECTRON_MODE = os.environ.get('ELECTRON_MODE') == '1'
+CROSS_SITE_COOKIES = IS_PRODUCTION or ELECTRON_MODE
+
 # SECURITY: sessions are signed cookies, so SECRET_KEY is what stops anyone
 # forging a login cookie. There must be NO guessable fallback in production.
 _secret = os.environ.get('SECRET_KEY')
@@ -71,9 +77,9 @@ app.config['SECRET_KEY'] = _secret
 # each session and enforced by enforce_session_expiry() below.
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
 
-app.config['SESSION_COOKIE_SECURE'] = IS_PRODUCTION
+app.config['SESSION_COOKIE_SECURE'] = CROSS_SITE_COOKIES
 app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'None' if IS_PRODUCTION else 'Lax'
+app.config['SESSION_COOKIE_SAMESITE'] = 'None' if CROSS_SITE_COOKIES else 'Lax'
 app.config['SESSION_COOKIE_DOMAIN'] = os.environ.get('SESSION_COOKIE_DOMAIN') or None
 
 
@@ -107,6 +113,7 @@ ALLOWED_ORIGINS = [
     'http://127.0.0.1:5000',
     'http://127.0.0.1:5173',
     'http://127.0.0.1:5174',
+    'app://civil-registry',   # Electron desktop app
 ]
 
 extra_origins = os.environ.get('CORS_EXTRA_ORIGINS', '')
@@ -244,6 +251,7 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"SECRET_KEY: {'Set' if app.config['SECRET_KEY'] else 'Not Set'}")
     print("SESSION_TYPE: signed cookie (Flask default)")
+    print(f"ELECTRON_MODE: {ELECTRON_MODE}")
     print(f"SESSION_COOKIE_SAMESITE: {app.config['SESSION_COOKIE_SAMESITE']}")
     print(f"SESSION_COOKIE_SECURE: {app.config['SESSION_COOKIE_SECURE']}")
     print(f"IS_PRODUCTION: {IS_PRODUCTION}")
@@ -252,5 +260,9 @@ if __name__ == "__main__":
 
     # Debug mode (Werkzeug debugger = remote code execution) is OFF unless you
     # explicitly set FLASK_DEBUG=1 on your own machine.
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1',
-            threaded=True, host='0.0.0.0', port=5000)
+    app.run(
+        debug=os.environ.get('FLASK_DEBUG') == '1',
+        threaded=True,
+        host='0.0.0.0',
+        port=int(os.environ.get('API_PORT', 5000)),
+    )
