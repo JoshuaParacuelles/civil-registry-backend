@@ -8,7 +8,7 @@ from flask import Blueprint, g, jsonify, request, session
 from werkzeug.exceptions import HTTPException
 
 from auth.Rolemanagement import get_user_permissions, is_admin
-from security import audit_denial, entity_permission_hook
+from logs.Audits import mask_identifier, record_action, record_document_eventfrom security import audit_denial, entity_permission_hook
 from supabase_client import supabase
 
 document_bp = Blueprint("document", __name__, url_prefix="/api/documents")
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Bump this when the response shape changes. Shown in the X-Document-Api
 # response header so you can confirm which code is running.
-DOCUMENT_API_VERSION = "handled-v2"
+DOCUMENT_API_VERSION = "handled-v3"
 
 
 @document_bp.errorhandler(Exception)
@@ -556,6 +556,26 @@ def _handled_by_user(stages, username):
     return any((s.get("completed_by") or "").lower() == target for s in (stages or []))
 
 
+def _audit_snapshot(doc, stages, active):
+    """
+    The last known state of a document, captured before it is deleted, so the
+    audit entry still says what was removed. Uses only the fields the audit
+    trail is allowed to hold.
+    """
+    handled_by = None
+    if active:
+        names = _handler_names([active.get("assigned_handler_id")])
+        handled_by = _resolve_stage_handler_name(active, names, _stage_holder_map())
+    return {
+        "status": STATUS_LABELS.get(doc.get("status"))
+                  or ("Rejected" if doc.get("rejected") else "In review"),
+        "step": active.get("label") if active else "Completed",
+        "handled_by": handled_by,
+        "document_type": doc.get("doc_type"),
+        "doc_number": doc.get("doc_number"),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Handler pool (personnel)
 # ─────────────────────────────────────────────────────────────────────────
@@ -630,6 +650,12 @@ def add_handler():
         return jsonify({"error": "Could not add this person"}), 500
 
     new_person = res.data[0]
+    record_action(
+        "PERSONNEL_ADDED",
+        "Added personnel to the document handler pool",
+        resource_type="document_personnel",
+        resource_id=new_person["id"],
+    )
     return jsonify({"id": new_person["id"], "name": new_person.get("full_name") or name}), 201
 
 
@@ -685,6 +711,12 @@ def delete_handler(handler_id):
         logger.exception("Failed to delete handler %s", handler_id)
         return jsonify({"error": f"Could not remove this person: {e}"}), 500
 
+    record_action(
+        "PERSONNEL_REMOVED",
+        "Removed personnel from the document handler pool",
+        resource_type="document_personnel",
+        resource_id=handler_id,
+    )
     return jsonify({"ok": True})
 
 
@@ -829,6 +861,15 @@ def create_document():
 
     new_doc = doc_res.data[0]
 
+    record_document_event(
+        "DOCUMENT_CREATED",
+        new_doc["id"],
+        "Created document",
+        new_status="In review",
+        document_type=doc_type,
+        extra_meta={"doc_number": doc_number},
+    )
+
     try:
         execute_with_retry(
             supabase.table("document_stages").insert([
@@ -951,11 +992,12 @@ def archive_document(document_id):
 
     try:
         res = execute_with_retry(
-            supabase.table("documents").select("id, archived_at").eq("id", document_id).limit(1)
+            supabase.table("documents").select("*").eq("id", document_id).limit(1)
         )
         if not res.data:
             return jsonify({"error": "Document not found"}), 404
-        if res.data[0].get("archived_at"):
+        doc = res.data[0]
+        if doc.get("archived_at"):
             return jsonify({"error": "This document is already in the archive"}), 409
 
         execute_with_retry(
@@ -967,6 +1009,14 @@ def archive_document(document_id):
         logger.exception("Failed to archive document %s", document_id)
         return jsonify({"error": f"Could not archive this document: {e}"}), 500
 
+    record_document_event(
+        "DOCUMENT_ARCHIVED",
+        document_id,
+        "Moved document to the archive",
+        old_status=STATUS_LABELS.get(doc.get("status")),
+        new_status="Archived",
+        document_type=doc.get("doc_type"),
+    )
     return jsonify({"ok": True})
 
 
@@ -982,11 +1032,12 @@ def restore_document(document_id):
 
     try:
         res = execute_with_retry(
-            supabase.table("documents").select("id, archived_at").eq("id", document_id).limit(1)
+            supabase.table("documents").select("*").eq("id", document_id).limit(1)
         )
         if not res.data:
             return jsonify({"error": "Document not found"}), 404
-        if not res.data[0].get("archived_at"):
+        doc = res.data[0]
+        if not doc.get("archived_at"):
             return jsonify({"error": "This document is not in the archive"}), 409
 
         execute_with_retry(
@@ -998,6 +1049,14 @@ def restore_document(document_id):
         logger.exception("Failed to restore document %s", document_id)
         return jsonify({"error": f"Could not restore this document: {e}"}), 500
 
+    record_document_event(
+        "DOCUMENT_RESTORED",
+        document_id,
+        "Restored document from the archive",
+        old_status="Archived",
+        new_status=STATUS_LABELS.get(doc.get("status")) or "In review",
+        document_type=doc.get("doc_type"),
+    )
     return jsonify({"ok": True})
 
 
@@ -1006,6 +1065,10 @@ def delete_document(document_id):
     """
     Admin-only. Permanently removes an ARCHIVED document. Child rows
     (stages, comments, assignments) are removed by ON DELETE CASCADE.
+
+    The audit entry is written after the delete succeeds, using a snapshot
+    taken beforehand. If the delete fails, a FAILED entry is written instead,
+    so the log never records a deletion that did not happen.
     """
     err = require_login()
     if err:
@@ -1014,27 +1077,47 @@ def delete_document(document_id):
     if err:
         return err
 
+    doc_type = None
     try:
-        res = execute_with_retry(
-            supabase.table("documents")
-            .select("id, archived_at")
-            .eq("id", document_id)
-            .limit(1)
-        )
-        if not res.data:
+        doc, stages, active = _load_document_context(document_id)
+        if not doc:
             return jsonify({"error": "Document not found"}), 404
-        if not res.data[0].get("archived_at"):
+        if not doc.get("archived_at"):
             return jsonify({
                 "error": "Move the document to the archive before deleting it permanently."
             }), 409
+
+        doc_type = doc.get("doc_type")
+        snapshot = _audit_snapshot(doc, stages, active)
 
         execute_with_retry(
             supabase.table("documents").delete().eq("id", document_id)
         )
     except Exception as e:
         logger.exception("Failed to delete document %s", document_id)
+        record_document_event(
+            "DOCUMENT_DELETED_PERMANENTLY",
+            document_id,
+            "Permanent delete of document failed",
+            status="FAILED",
+            document_type=doc_type,
+        )
         return jsonify({"error": f"Could not delete this document: {e}"}), 500
 
+    record_document_event(
+        "DOCUMENT_DELETED_PERMANENTLY",
+        document_id,
+        "Permanently deleted archived document",
+        old_status=snapshot["status"],
+        new_status="Deleted",
+        step=snapshot["step"],
+        handled_by=snapshot["handled_by"],
+        document_type=snapshot["document_type"],
+        extra_meta={
+            "doc_number": snapshot["doc_number"],
+            "stages_removed": len(stages),
+        },
+    )
     return jsonify({"ok": True})
 
 
@@ -1064,13 +1147,14 @@ def assign_handler(document_id):
     try:
         doc_lock_check = execute_with_retry(
             supabase.table("documents")
-            .select("assigned_handler_id, deleted_handler_id")
+            .select("assigned_handler_id, deleted_handler_id, doc_type")
             .eq("id", document_id)
             .limit(1)
         )
         if not doc_lock_check.data:
             return jsonify({"error": "Document not found"}), 404
         doc_lock_row = doc_lock_check.data[0]
+        doc_type = doc_lock_row.get("doc_type")
 
         left_unassigned_by_deletion = (
             doc_lock_row.get("assigned_handler_id") is None
@@ -1084,12 +1168,14 @@ def assign_handler(document_id):
 
         handler_check = execute_with_retry(
             supabase.table("document_personnel")
-            .select("id, deleted_at")
+            .select("id, deleted_at, full_name")
             .eq("id", handler_id)
             .limit(1)
         )
         if not handler_check.data:
             return jsonify({"error": "That person isn't in the handler pool"}), 400
+
+        handler_name = handler_check.data[0].get("full_name")
 
         if handler_check.data[0].get("deleted_at") is not None:
             doc_check = execute_with_retry(
@@ -1123,6 +1209,13 @@ def assign_handler(document_id):
         logger.exception("Failed to assign handler for document %s", document_id)
         return jsonify({"error": f"Could not assign this person: {e}"}), 500
 
+    record_document_event(
+        "DOCUMENT_ASSIGNED",
+        document_id,
+        "Assigned document to a handler",
+        handled_by=handler_name,
+        document_type=doc_type,
+    )
     return jsonify({"ok": True})
 
 
@@ -1142,7 +1235,7 @@ def assign_stage_handler(document_id, stage_order):
     try:
         stage_res = execute_with_retry(
             supabase.table("document_stages")
-            .select("id")
+            .select("id, label")
             .eq("document_id", document_id)
             .eq("stage_order", stage_order)
             .limit(1)
@@ -1153,6 +1246,7 @@ def assign_stage_handler(document_id, stage_order):
     if not stage_res.data:
         return jsonify({"error": "Stage not found"}), 404
     stage_id = stage_res.data[0]["id"]
+    stage_label = stage_res.data[0].get("label")
 
     if handler_id in (None, "", 0, "0"):
         handler_id = None
@@ -1185,6 +1279,15 @@ def assign_stage_handler(document_id, stage_order):
         logger.exception("Failed to assign stage handler for document %s stage %s", document_id, stage_order)
         return jsonify({"error": f"Could not assign this person to this step: {e}"}), 500
 
+    record_document_event(
+        "DOCUMENT_STEP_ASSIGNED",
+        document_id,
+        "Assigned personnel to a step" if handler_id is not None
+        else "Removed personnel from a step",
+        step=stage_label,
+        handled_by=handler_name,
+        extra_meta={"stage_order": stage_order},
+    )
     return jsonify({
         "ok": True,
         "stage_order": stage_order,
@@ -1251,6 +1354,22 @@ def complete_stage(document_id, stage_order):
     if not res.data:
         return jsonify({"error": "This step has already been completed."}), 409
 
+    is_release = _is_releasing_stage(stage)
+    record_document_event(
+        "DOCUMENT_RELEASED" if is_release else "DOCUMENT_STEP_UPDATED",
+        document_id,
+        "Document released to its destination" if is_release
+        else f"Completed step: {stage.get('label')}",
+        step=stage.get("label"),
+        old_status="Pending",
+        new_status="Released" if is_release else "Completed",
+        handled_by=current_username(),
+        document_type=doc.get("doc_type"),
+        extra_meta=(
+            {"release_destination": stage.get("release_destination")} if is_release else None
+        ),
+    )
+
     return jsonify({"ok": True, "completed_at": res.data[0].get("completed_at")})
 
 
@@ -1273,6 +1392,19 @@ def save_registry_number(document_id, stage_order):
         supabase.table("document_stages")
         .update({"registry_number": registry_number})
         .eq("id", stage["id"])
+    )
+
+    record_document_event(
+        "REGISTRY_NUMBER_ASSIGNED",
+        document_id,
+        "Registry number saved",
+        step=stage.get("label"),
+        new_status="Registry number saved",
+        handled_by=current_username(),
+        document_type=ctx["doc"].get("doc_type"),
+        # Only the masked form is logged. The full number stays in the
+        # document record.
+        extra_meta={"registry_number_masked": mask_identifier(registry_number)},
     )
     return jsonify({"ok": True, "registry_number": registry_number})
 
@@ -1301,6 +1433,8 @@ def save_release_destination(document_id, stage_order):
         .update({"release_destination": destination})
         .eq("id", stage["id"])
     )
+    # The destination is included in the DOCUMENT_RELEASED entry when the
+    # Releasing step is completed, so it is not logged separately here.
     return jsonify({"ok": True, "release_destination": destination})
 
 
@@ -1332,6 +1466,17 @@ def start_posting_period(document_id, stage_order):
     )
     if not res.data:
         return jsonify({"error": "The posting period has already been started for this step"}), 409
+
+    record_document_event(
+        "DOCUMENT_STEP_UPDATED",
+        document_id,
+        f"Started the {POSTING_PERIOD_DAYS}-day posting period",
+        step=stage.get("label"),
+        new_status="Posting",
+        handled_by=current_username(),
+        document_type=ctx["doc"].get("doc_type"),
+        extra_meta={"posting_end_at": end_at.isoformat()},
+    )
 
     return jsonify({
         "ok": True,
@@ -1370,6 +1515,19 @@ def flag_stage(document_id, stage_order):
             "body": note,
         }).select("*")
     )
+
+    record_document_event(
+        "DOCUMENT_STEP_UPDATED",
+        document_id,
+        f"Flagged step for changes: {stage.get('label')}",
+        step=stage.get("label"),
+        new_status="Changes requested",
+        handled_by=current_username(),
+        document_type=ctx["doc"].get("doc_type"),
+        # The note text is not logged; only its length.
+        extra_meta={"note_length": len(note)},
+    )
+
     row = res.data[0] if res.data else {"body": note}
     return jsonify({"ok": True, "comment": _shape_comment(row, author)})
 
@@ -1399,6 +1557,17 @@ def reject_document(document_id):
     execute_with_retry(
         supabase.table("documents").update({"rejected": True}).eq("id", document_id)
     )
+
+    record_document_event(
+        "DOCUMENT_REJECTED",
+        document_id,
+        "Document rejected",
+        old_status=STATUS_LABELS.get(doc.get("status")),
+        new_status="Rejected",
+        step=active.get("label") if active else None,
+        handled_by=current_username(),
+        document_type=doc.get("doc_type"),
+    )
     return jsonify({"ok": True})
 
 
@@ -1427,6 +1596,18 @@ def add_comment(document_id, stage_order):
             "body": text,
         }).select("*")
     )
+
+    record_document_event(
+        "DOCUMENT_COMMENT_ADDED",
+        document_id,
+        f"Added a comment on step: {stage.get('label')}",
+        step=stage.get("label"),
+        handled_by=current_username(),
+        document_type=ctx["doc"].get("doc_type"),
+        # The comment text is not logged; only its length.
+        extra_meta={"comment_length": len(text)},
+    )
+
     row = res.data[0] if res.data else {"body": text}
     return jsonify(_shape_comment(row, author)), 201
 

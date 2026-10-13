@@ -2,7 +2,7 @@
   "admin": {
     "id": 11,
     "username": "admin",
-    "password": "scrypt:32768:8:1$PbgsIGTW5aXwZqOq$257b690b5877761bbe330c465b2c50d628ae193309de9405866039cdd5c7faec6911ed60c2c0850ae7b8d43290b3ad94a01c893d0ca3d9acaf374cb395f011e7",
+    "password": "scrypt:32768:8:1$jW6PWC9pg1hqHdP5$d75d17a3e5a6220920d2f8b44e613c3745dcb962b0af74e812ec90202844a6f06b65341ba8788438dc390c44762989bb20184077720e29f4576adcebe9b8300b",
     "roles": [
       "Administrator"
     ],
@@ -28,7 +28,7 @@
       "role_management",
       "user_management"
     ],
-    "saved_at": "2026-10-13T04:09:43.119945+00:00",
+    "saved_at": "2026-10-13T10:33:00.652818+00:00",
     "fail_count": 0,
     "locked_until": null
   },
@@ -63,7 +63,7 @@
       "dashboard",
       "offline_sync"
     ],
-    "saved_at": "2026-10-12T03:33:55.019551+00:00",
+    "saved_at": "2026-10-13T10:26:56.832550+00:00",
     "fail_count": 0,
     "locked_until": null
   },
@@ -134,6 +134,39 @@
       "offline_sync"
     ],
     "saved_at": "2026-10-11T08:15:11.635403+00:00",
+    "fail_count": 0,
+    "locked_until": null
+  },
+  "joshua123": {
+    "id": 11,
+    "username": "joshua123",
+    "password": "scrypt:32768:8:1$ClBxVwr5N9i2xTb4$838049af8ac46cef12ff3f4828e2c8adbadc8131cff35a8c80cba5e8608f037e5e6e1b1a167a9765f2d1a36cd1676dd7ba4711395f301060a72010ae77dd315d",
+    "roles": [
+      "Administrator"
+    ],
+    "permissions": [
+      "*",
+      "audit_logs",
+      "birth_archive_uploader",
+      "birth_verification",
+      "change_password",
+      "dashboard",
+      "death_archive_uploader",
+      "death_verification",
+      "document_stage_civil_registrar",
+      "document_stage_posting_period",
+      "document_stage_records_division",
+      "document_stage_registration",
+      "document_stage_registry_number",
+      "document_stage_releasing",
+      "document_tracking",
+      "marriage_archive_uploader",
+      "marriage_verification",
+      "offline_sync",
+      "role_management",
+      "user_management"
+    ],
+    "saved_at": "2026-10-13T10:24:09.750272+00:00",
     "fail_count": 0,
     "locked_until": null
   }
