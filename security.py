@@ -1,8 +1,11 @@
 """Shared security helpers so every sensitive route is protected the same way."""
+import logging
 import re
 from functools import wraps
 
 from flask import g, has_request_context, jsonify, request, session
+
+logger = logging.getLogger(__name__)
 
 VERCEL_ORIGIN_PATTERNS = [
     re.compile(r"^https://civil-registry-scc\.vercel\.app$"),
@@ -28,6 +31,16 @@ ENTITY_PERMISSIONS = {
 # Only changes are guarded. Reads stay open so the dashboard and analytics
 # keep working for every role.
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# Routine session probes that fire on every page load. Recording them would
+# bury real denials in the audit log.
+_ROUTINE_PROBE_PATHS = {
+    "/api/session",
+    "/api/my-permissions",
+    "/api/current-user",
+    "/api/login",
+    "/api/audit/access-denied",
+}
 
 
 def _is_vercel_origin(origin: str) -> bool:
@@ -92,36 +105,44 @@ def _is_admin(username):
 
 
 def audit_denial(reason, action="ACCESS_DENIED"):
-    """Best-effort server-side denial event; skips routine session probes."""
+    """Record a denial once per request, using the logged-in identity.
+
+    Anonymous requests and routine session probes are not recorded. The
+    request is still marked as handled, so the generic 401/403 hook in
+    app.py does not write a second row for it.
+    """
     if not has_request_context():
         return
-    if request.path in {
-        "/api/session", "/api/my-permissions", "/api/current-user",
-        "/api/login", "/api/audit/access-denied",
-    } and action != "SESSION_EXPIRED":
+    # Mark first: whether or not this call writes a row, the generic hook
+    # in app.py must not also write one for this request.
+    if getattr(g, "_denial_logged", False):
         return
-    if getattr(g, "_audit_denial_logged", False):
+    g._denial_logged = True
+
+    if request.path in _ROUTINE_PROBE_PATHS and action != "SESSION_EXPIRED":
         return
-    g._audit_denial_logged = True
-    username = session.get("username") or "System"
+
+    username = session.get("username")
+    if not username and action != "SESSION_EXPIRED":
+        return
+
     role = session.get("role") or ("Administrator" if session.get("is_admin") else None)
     try:
+        # Lazy import: logs.Audits imports this module at load time.
         from logs.Audits import record_action
 
         record_action(
             action,
             reason,
-            username=username,
+            username=username or "System",
             role=role,
             status="DENIED",
             resource_type="route",
             resource_id=request.path,
-            meta={"route": request.path, "method": request.method, "role": role},
-            ip=request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr,
+            meta={"route": request.path, "method": request.method},
         )
     except Exception as exc:
-        import logging
-        logging.getLogger(__name__).exception("Could not record access denial: %s", exc)
+        logger.exception("Could not record access denial: %s", exc)
 
 
 def admin_required(fn):
