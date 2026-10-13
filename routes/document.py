@@ -8,7 +8,8 @@ from flask import Blueprint, g, jsonify, request, session
 from werkzeug.exceptions import HTTPException
 
 from auth.Rolemanagement import get_user_permissions, is_admin
-from logs.Audits import mask_identifier, record_action, record_document_eventfrom security import audit_denial, entity_permission_hook
+from logs.Audits import mask_identifier, record_action, record_document_event
+from security import audit_denial, entity_permission_hook
 from supabase_client import supabase
 
 document_bp = Blueprint("document", __name__, url_prefix="/api/documents")
