@@ -1,11 +1,6 @@
-# Save this file as ".gitignore" (with the leading dot) in the root of the
-# repo. The same file works for backend/ and for the frontend, because the
-# patterns are not anchored to a folder name.
-
 # ---------- Environment variables: never commit real secrets ----------
 .env
 .env.*
-# ...but DO keep a template with variable names only (no values)
 !.env.example
 
 # ---------- Python ----------
@@ -16,34 +11,22 @@ venv/
 .venv/
 .pytest_cache/
 
-# ---------- Node / React ----------
-node_modules/
-build/
-dist/
-.vercel/
-coverage/
-
-# ---------- Runtime data (personal records, sessions) ----------
-# Unanchored on purpose: works whether the repo root is the folder ABOVE
-# backend/ or backend/ itself.
-flask_session/
+# ---------- Runtime data (citizen records, sessions) ----------
 uploads/
+flask_session/
 _quarantine/
 keep.txt
+backend.log
 *.log
 
-# ---------- Local databases (user accounts, roles, password hashes) ----------
-# NOTE: if your deployed backend still reads users.db / roles.db from the
-# repo, a fresh deploy will start with NO users. Move auth fully to Supabase
-# (or seed these on the server) before untracking them.
+# ---------- Local credentials and databases ----------
+local_users.json
 *.db
 *.sqlite3
 
-# ---------- One-off admin helpers ----------
-# Uncomment if these contain real or hardcoded passwords. Better: change that
-# password and delete the file once it is no longer needed.
-# fix_admin_password.py
-# fix_password.py
+# ---------- One-off admin helpers (may contain passwords) ----------
+fix_admin_password.py
+fix_password.py
 
 # ---------- OS / editor junk ----------
 .DS_Store
