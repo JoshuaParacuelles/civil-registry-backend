@@ -15,6 +15,8 @@ Environment variables
   Gmail SMTP:
     GMAIL_SENDER_EMAIL         the real Gmail address you send from
     GMAIL_SENDER_APP_PASSWORD  16-char Gmail app password (spaces are OK)
+    SMTP_HOST                  default smtp.gmail.com
+    SMTP_PORT                  587 (STARTTLS) or 465 (SSL). Default 587.
   Brevo (optional):
     BREVO_API_KEY              API key from Brevo
     BREVO_SENDER_EMAIL         a sender verified in Brevo (falls back to
@@ -35,6 +37,10 @@ SCC (scc.png) and Local Civil Registry (lcr.jpg) logos in the header. The
 plain-text version is still included as a fallback for mail clients that
 don't show HTML. The logos must be publicly reachable, so both files live
 in the frontend's public/ folder and are loaded from EMAIL_LOGO_BASE_URL.
+
+CHANGED (diagnostics): the Gmail SMTP path now tracks which step failed
+(connect / ehlo / starttls / login / send) and logs a specific message for
+each kind of failure, instead of one generic "could not connect" message.
 """
 
 import json
@@ -187,7 +193,11 @@ def _send_via_brevo(to_email, subject, body):
 
 
 def _send_via_gmail_smtp(to_email, subject, body):
-    """Send through Gmail SMTP. Returns True/False, never raises."""
+    """Send through Gmail SMTP. Returns True/False, never raises.
+
+    Tracks which step failed, so the log says exactly where the
+    connection broke (connect / ehlo / starttls / login / send).
+    """
     if not GMAIL_SENDER_EMAIL:
         print("[email_service] GMAIL_SENDER_EMAIL not set — skipping email notification.")
         return False
@@ -214,30 +224,59 @@ def _send_via_gmail_smtp(to_email, subject, body):
     msg.set_content(body)
     msg.add_alternative(_build_html_email(subject, body), subtype="html")
 
+    context = ssl.create_default_context()
+    use_ssl = SMTP_PORT == 465
+    step = "connect"
+
     try:
-        context = ssl.create_default_context()
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
-            server.starttls(context=context)
+        if use_ssl:
+            server = smtplib.SMTP_SSL(
+                SMTP_HOST, SMTP_PORT, context=context, timeout=SMTP_TIMEOUT_SECONDS
+            )
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS)
+
+        with server:
+            step = "ehlo"
+            server.ehlo()
+            if not use_ssl:
+                step = "starttls"
+                server.starttls(context=context)
+                step = "ehlo (after starttls)"
+                server.ehlo()
+            step = "login"
             server.login(GMAIL_SENDER_EMAIL, GMAIL_SENDER_APP_PASSWORD)
+            step = "send"
             server.send_message(msg)
+
         print(f"[email_service] Status-update email sent to {to_email}")
         return True
+
     except smtplib.SMTPAuthenticationError as e:
         print(
-            "[email_service] Gmail rejected the login. Check GMAIL_SENDER_EMAIL / "
-            f"GMAIL_SENDER_APP_PASSWORD (needs a Google app password, 2-Step Verification on): {e}"
+            "[email_service] Gmail rejected the login (step: login). Check "
+            "GMAIL_SENDER_EMAIL and GMAIL_SENDER_APP_PASSWORD. Use a Google "
+            f"app password with 2-Step Verification on: {e}"
         )
         return False
-    except (socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+    except smtplib.SMTPServerDisconnected as e:
         print(
-            f"[email_service] Could not connect to {SMTP_HOST}:{SMTP_PORT} within "
-            f"{SMTP_TIMEOUT_SECONDS}s ({e}). If this runs on Render's free tier, outbound "
-            "SMTP ports 25/465/587 are blocked — set BREVO_API_KEY to send over HTTPS "
-            "instead, or upgrade the instance."
+            f"[email_service] Server closed the connection during '{step}' "
+            f"({SMTP_HOST}:{SMTP_PORT}). Usually an antivirus mail/web shield, "
+            f"firewall, or VPN intercepting SMTP: {e}"
         )
+        return False
+    except smtplib.SMTPException as e:
+        print(f"[email_service] SMTP error during '{step}': {type(e).__name__}: {e}")
+        return False
+    except (socket.timeout, TimeoutError):
+        print(f"[email_service] Timed out during '{step}' after {SMTP_TIMEOUT_SECONDS}s.")
+        return False
+    except OSError as e:
+        print(f"[email_service] Network error during '{step}': {type(e).__name__}: {e}")
         return False
     except Exception as e:
-        print(f"[email_service] Failed to send status-update email to {to_email}: {e}")
+        print(f"[email_service] Unexpected error during '{step}': {type(e).__name__}: {e}")
         return False
 
 
