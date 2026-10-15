@@ -1158,7 +1158,7 @@ def upload_record():
         extracted["mother_last_name"]   = mother_last_name
         extracted["mother_full_name"]   = _build_full_name(mother_first_name, mother_middle_name, mother_last_name)
 
-        now = datetime.now().isoformat()
+        now = now_ph().isoformat()
 
         # Store a single, clean base64 string (pdf_data must be a `text`
         # column, not bytea — see the note above _looks_like_pdf).
@@ -1275,7 +1275,7 @@ def update_relatives(record_id):
             "father_last_name": father_last_name, "father_full_name": father_full_name,
             "mother_first_name": mother_first_name, "mother_middle_name": mother_middle_name,
             "mother_last_name": mother_last_name, "mother_full_name": mother_full_name,
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": now_ph().isoformat(),
         }).eq("id", record_id).execute()
 
         record_action(
@@ -1520,7 +1520,7 @@ def archive_record(record_id):
 
         # UPDATE body (not a filter), so a Python bool is fine here.
         supabase.table("birth_records").update(
-            {"is_archived": True, "archived_at": datetime.now().isoformat()}
+            {"is_archived": True, "archived_at": now_ph().isoformat()}
         ).eq("id", record_id).execute()
 
         record_action(
@@ -2259,7 +2259,7 @@ def _repair_row(record_id, real_path, row=None):
         supabase.table("marriage_records").update({
             "stored_file_name": real_name,
             "file_path": real_path,
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": now_ph().isoformat(),
         }).eq("id", record_id).execute()
     except Exception:
         pass
@@ -2304,7 +2304,7 @@ def admin_repair_paths():
                 supabase.table("marriage_records").update({
                     "stored_file_name": os.path.basename(rp),
                     "file_path": rp,
-                    "updated_at": datetime.now().isoformat(),
+                    "updated_at": now_ph().isoformat(),
                 }).eq("id", row["id"]).execute()
                 repaired.append({"id": row["id"], "old": stored, "new": os.path.basename(rp)})
             else:
@@ -2459,7 +2459,7 @@ def admin_backfill_is_archived():
         for rid in ids:
             supabase.table("marriage_records").update({
                 "is_archived": False,
-                "updated_at": datetime.now().isoformat(),
+                "updated_at": now_ph().isoformat(),
             }).eq("id", rid).execute()
 
         return jsonify({"success": True, "updated": len(ids), "ids": ids}), 200
@@ -2512,7 +2512,7 @@ def admin_set_archived():
         except (TypeError, ValueError):
             return jsonify({"error": "'ids' must all be integers."}), 400
 
-        now_iso = datetime.now().isoformat()
+        now_iso = now_ph().isoformat()
         update_payload = {
             "is_archived": archived,
             "updated_at": now_iso,
@@ -2759,7 +2759,7 @@ def _upload_pdf(target="archive"):
         pdf_fields = extract_pdf_fields(file_path)
         mapped     = map_marriage_pdf_fields(pdf_fields)
 
-        now_iso = datetime.now().isoformat()
+        now_iso = now_ph().isoformat()
         insert_payload = {
             "file_name": file_name,
             "original_file_name": original_file_name,
@@ -2879,7 +2879,7 @@ def archive_record(record_id):
             except Exception:
                 pass
 
-        now_iso = datetime.now().isoformat()
+        now_iso = now_ph().isoformat()
         # UPDATE body (not a filter), so a Python bool is fine here.
         supabase.table("marriage_records").update({
             "is_archived": True,
@@ -2923,7 +2923,7 @@ def restore_record(record_id):
             except Exception:
                 pass
 
-        now_iso = datetime.now().isoformat()
+        now_iso = now_ph().isoformat()
         supabase.table("marriage_records").update({
             "is_archived": False,
             "archived_at": None,
@@ -2961,7 +2961,7 @@ def update_spouses(record_id):
         fields = ["groom_first_name", "groom_middle_name", "groom_last_name",
                   "bride_first_name",  "bride_middle_name",  "bride_last_name"]
         update_payload = {f: clean(data.get(f)) for f in fields}
-        update_payload["updated_at"] = datetime.now().isoformat()
+        update_payload["updated_at"] = now_ph().isoformat()
 
         supabase.table("marriage_records").update(update_payload).eq("id", record_id).execute()
         return jsonify({"success": True}), 200
