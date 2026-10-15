@@ -1,35 +1,3 @@
-"""
-routes/notification.py
------------------------
-Notification system (admin bell + SSE stream), backed by Supabase.
-
-Table used (see notification_schema.sql):
-    id, record_type ('birth'|'death'|'marriage'), record_id,
-    control_no, title, message, request_snapshot jsonb,
-    is_read, created_at, read_at, read_by
-
-NOTE: this module only handles the IN-APP notifications (bell icon / live
-stream). It does NOT send emails or SMS. Those are sent from
-routes/email_service.py and routes/sms_service.py, called by
-routes/citizen_requests.py.
-
-CHANGES IN THIS VERSION (behavior is otherwise identical):
-  1. Boolean filters now go through _bool_filter() ("true"/"false" strings),
-     the same convention used in birth/marriage/death routes, instead of
-     passing raw Python bools into .eq().
-  2. push_notification() no longer RAISES on a bad record_type. It logs and
-     returns None. Callers invoke it after the transaction is already saved,
-     so raising turned a notification problem into a 500 for the user.
-  3. Optional login protection (NOTIFICATIONS_REQUIRE_LOGIN=1). Off by
-     default so nothing breaks until the frontend sends cookies.
-  4. SSE CORS origin is configurable (SSE_ALLOW_ORIGIN) instead of a
-     hardcoded "*". Default is still "*" so current behavior is unchanged.
-  5. mark_read rejects booleans in the ids list.
-
-ENV VARIABLES (all optional):
-  NOTIFICATIONS_REQUIRE_LOGIN=1   require session["username"] on every route
-  SSE_ALLOW_ORIGIN=https://your-app.vercel.app   lock the SSE stream to your site
-"""
 
 import json
 import logging
