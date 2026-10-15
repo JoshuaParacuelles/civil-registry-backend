@@ -1,4 +1,4 @@
-import io
+﻿import io
 import re
 import os
 import json
@@ -17,7 +17,7 @@ from postgrest.exceptions import APIError
 from supabase_client import supabase
 from routes.notification import push_notification
 from routes.analytics import invalidate_analytics_cache  # analytics cache
-from logs.Audits import record_action
+from logs.Audits import record_action, client_ip
 from security import login_required_hook, admin_required, entity_permission_hook
 
 
@@ -44,6 +44,21 @@ def get_user():
     """Username of the logged-in user ("System" only if there is no session,
     which the login hook below now prevents for these blueprints)."""
     return session.get("username", "System")
+
+
+def _audit_vital(action, description, *, record_type, record_id=None,
+                 file_name=None, status="SUCCESS", meta=None):
+    """Vital-records audit entry. record_action() already swallows its own errors."""
+    record_action(
+        action,
+        description,
+        username=get_user(),
+        status=status,
+        resource_type=record_type,
+        resource_id=record_id,
+        meta={"record_id": record_id, "file_name": file_name, **(meta or {})},
+        ip=client_ip(),
+    )
 
 
 # =============================================================================
@@ -457,6 +472,8 @@ def upload_record():
             return jsonify({"error": "Failed to insert record."}), 500
 
         record_id = res.data[0]["id"]
+        _audit_vital("DEATH_PDF_UPLOADED", f"Uploaded death record PDF: '{file_stem}'",
+                     record_type="death_record", record_id=record_id, file_name=file_stem)
         invalidate_analytics_cache("death_records")  # analytics cache
 
         fetch_res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS).eq("id", record_id).single().execute()
@@ -474,6 +491,11 @@ def get_record_pdf(record_id: int):
         return jsonify({"error": "Record not found."}), 404
 
     data = res.data[0]
+    # Background prefetch (offline support) is not a user viewing the record.
+    if request.args.get("prefetch") != "1":
+        _audit_vital("DEATH_RECORD_VIEWED", f"Viewed death record: '{data.get('file_name', record_id)}'",
+                     record_type="death_record", record_id=record_id, file_name=data.get("file_name"))
+
     pdf_b64 = data.get("pdf_file")
     if not pdf_b64:
         return jsonify({"error": "PDF file not found in database."}), 404
@@ -496,6 +518,9 @@ def download_record_pdf(record_id: int):
         return jsonify({"error": "PDF file not found in database."}), 404
 
     pdf_bytes = base64.b64decode(pdf_b64)
+    _audit_vital("PDF_DOWNLOADED", f"Downloaded death record PDF: '{row.get('original_file_name')}'",
+                 record_type="death_record", record_id=record_id,
+                 file_name=row.get("original_file_name"))
 
     return send_file(
         io.BytesIO(pdf_bytes),
@@ -521,7 +546,7 @@ def archive_record(record_id: int):
         # Audit trail: every archive action is logged.
         archived_row = res.data[0] if res.data else {}
         record_action(
-            "ARCHIVE",
+            "RECORD_ARCHIVED",
             f"Archived death record: '{archived_row.get('file_name', record_id)}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": archived_row.get("file_name")},
@@ -549,7 +574,7 @@ def restore_record(record_id: int):
         # Audit trail: every restore action is logged.
         restored_row = res.data[0] if res.data else {}
         record_action(
-            "RESTORE",
+            "RECORD_RESTORED",
             f"Restored death record: '{restored_row.get('file_name', record_id)}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": restored_row.get("file_name")},
@@ -567,7 +592,12 @@ def delete_record(record_id: int):
         res = supabase.table("death_records").delete().eq("id", record_id).execute()
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
+        file_name = res.data[0].get("file_name")
         invalidate_analytics_cache("death_records")  # analytics cache
+
+        _audit_vital("RECORD_DELETED_PERMANENTLY",
+                     f"Permanently deleted death record: '{file_name or record_id}'",
+                     record_type="death_record", record_id=record_id, file_name=file_name)
         return jsonify({"success": True, "message": "Record deleted permanently."}), 200
     except Exception as e:
         return jsonify({"error": f"Failed to delete record: {str(e)}"}), 500
@@ -621,6 +651,9 @@ def complete_transaction():
             "last_name": last_name,
             "created_at": now_dt().isoformat()
         }).execute()
+        _audit_vital("TRANSACTION_COMPLETED", f"Death transaction completed — {record_status}",
+                     record_type="death_record", record_id=record_id,
+                     meta={"payment_amount": payment_amount, "payment_reference": payment_reference})
         invalidate_analytics_cache("death_records")  # analytics cache
 
         # NOTIFICATION: only when the record was FOUND and it matches an
@@ -1208,7 +1241,7 @@ def upload_record():
         # matching record is found and a transaction is completed.
 
         record_action(
-            "UPLOAD",
+            "BIRTH_PDF_UPLOADED",
             f"Uploaded birth record to archive: '{file_name}'",
             username=get_user(),
             meta={
@@ -1279,7 +1312,7 @@ def update_relatives(record_id):
         }).eq("id", record_id).execute()
 
         record_action(
-            "UPDATE_RELATIVES",
+            "RELATIVES_UPDATED",
             f"Updated relatives for birth record: '{record['file_name']}'",
             username=get_user(),
             meta={
@@ -1361,8 +1394,8 @@ def complete_transaction():
             )
 
         record_action(
-            "TRANSACTION_COMPLETE",
-            f"Transaction completed for '{search_operator}' — {payment_status.upper()}",
+            "TRANSACTION_COMPLETED",
+            f"Birth transaction completed — {payment_status.upper()}",
             username=processed_by,
             meta={
                 "payment_id": payment_id,
@@ -1406,7 +1439,7 @@ def get_record(record_id):
 
         if request.args.get("prefetch") != "1":
             record_action(
-                "VIEW",
+                "BIRTH_RECORD_VIEWED",
                 f"Viewed birth record: '{record['file_name']}'",
                 username=get_user(),
                 meta={"record_id": record_id, "file_name": record['file_name']},
@@ -1447,7 +1480,7 @@ def view_record_pdf(record_id):
             return jsonify({"error": str(ve)}), status
 
         record_action(
-            "VIEW",
+            "PDF_VIEWED",
             f"Previewed birth record PDF: '{record['file_name']}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": record['file_name']},
@@ -1476,19 +1509,15 @@ def download_record(record_id):
             return jsonify({"error": "Record not found"}), 404
         record = rows[0]
 
-        record_action(
-            "DOWNLOAD",
-            f"Downloaded birth record: '{record['file_name']}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": record['file_name']},
-            ip=request.remote_addr
-        )
-
         try:
             pdf_bytes = _decode_pdf_data(record.get('pdf_data'))
         except ValueError as ve:
             status = 404 if "No PDF data" in str(ve) else 500
             return jsonify({"error": str(ve)}), status
+
+        # Logged only after the PDF decodes, so failed downloads aren't recorded as downloads.
+        _audit_vital("PDF_DOWNLOADED", f"Downloaded birth record PDF: '{record['file_name']}'",
+                     record_type="birth_record", record_id=record_id, file_name=record['file_name'])
 
         pdf_io = io.BytesIO(pdf_bytes)
         pdf_io.seek(0)
@@ -1524,7 +1553,7 @@ def archive_record(record_id):
         ).eq("id", record_id).execute()
 
         record_action(
-            "ARCHIVE",
+            "RECORD_ARCHIVED",
             f"Archived birth record: '{record['file_name']}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": record['file_name']},
@@ -1553,7 +1582,7 @@ def restore_record(record_id):
         ).eq("id", record_id).execute()
 
         record_action(
-            "RESTORE",
+            "RECORD_RESTORED",
             f"Restored birth record: '{record['file_name']}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": record['file_name']},
@@ -1578,7 +1607,7 @@ def delete_record(record_id):
         invalidate_analytics_cache("birth_records")  # analytics cache
 
         record_action(
-            "DELETE",
+            "RECORD_DELETED_PERMANENTLY",
             f"Permanently deleted birth record: '{file_name}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": file_name},
@@ -1619,7 +1648,7 @@ def verify_record():
 
         if record:
             record_action(
-                "SEARCH",
+                "RECORD_SEARCHED",
                 f"Birth record verify — FOUND: '{first_name} {last_name}'",
                 username=get_user(),
                 meta={"search": f"{first_name} {last_name}", "result": "ACTIVE"},
@@ -1632,7 +1661,7 @@ def verify_record():
             })
 
         record_action(
-            "SEARCH",
+            "RECORD_SEARCHED",
             f"Birth record verify — NOT FOUND: '{first_name} {last_name}'",
             username=get_user(),
             meta={"search": f"{first_name} {last_name}", "result": "NOT_FOUND"},
@@ -1707,8 +1736,8 @@ def create_payment():
             )
 
         record_action(
-            "PAYMENT",
-            f"Payment recorded for '{first_name} {last_name}' — status: {payment_status.upper()}",
+            "PAYMENT_RECORDED",
+            f"Payment recorded — status: {payment_status.upper()}",
             username=processed_by,
             meta={
                 "payment_id": payment_id,
@@ -2528,6 +2557,11 @@ def admin_set_archived():
             else:
                 missing.append(rid)
 
+        if updated:
+            _audit_vital("RECORD_ARCHIVED" if archived else "RECORD_RESTORED",
+                         f"Bulk {'archived' if archived else 'restored'} {len(updated)} marriage record(s)",
+                         record_type="marriage_record", meta={"record_ids": updated})
+
         return jsonify({
             "success": True,
             "archived": archived,
@@ -2667,6 +2701,12 @@ def _serve_pdf(record_id, as_attachment=False):
         with open(resolved, "rb") as f:
             pdf_bytes = f.read()
 
+        _audit_vital(
+            "PDF_DOWNLOADED" if as_attachment else "PDF_VIEWED",
+            f"{'Downloaded' if as_attachment else 'Previewed'} marriage record PDF",
+            record_type="marriage_record", record_id=record_id, file_name=row.get("file_name"),
+        )
+
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype="application/pdf",
@@ -2700,7 +2740,7 @@ def _delete_record(record_id):
         leftover = [os.path.basename(p) for p in paths if not _safe_remove(p)]
 
         record_action(
-            "DELETE",
+            "RECORD_DELETED_PERMANENTLY",
             f"Permanently deleted marriage record: '{row.get('file_name', record_id)}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": row.get("file_name"),
@@ -2749,6 +2789,9 @@ def _upload_pdf(target="archive"):
 
         dup_error = check_duplicate(original_file_name, file_hash)
         if dup_error:
+            _audit_vital("MARRIAGE_PDF_UPLOADED", "Upload rejected: duplicate file",
+                         record_type="marriage_record", status="FAILED",
+                         meta={"reason": "duplicate"})
             return jsonify({"error": dup_error}), 409
 
         tmp_path = file_path
@@ -2781,6 +2824,9 @@ def _upload_pdf(target="archive"):
 
         tmp_path = None
         new_row  = res.data[0]
+        _audit_vital("MARRIAGE_PDF_UPLOADED",
+                     f"Uploaded marriage record PDF to {'archive' if is_archived else 'registry'}",
+                     record_type="marriage_record", record_id=new_row.get("id"), file_name=file_name)
         invalidate_analytics_cache("marriage_records")  # analytics cache
 
         # No notification on upload — notifications fire only when a
@@ -2821,6 +2867,9 @@ def get_record_with_pdf(record_id):
         if not res.data:
             return jsonify({"error": "Record not found."}), 404
         row = res.data[0]
+
+        _audit_vital("MARRIAGE_RECORD_VIEWED", f"Viewed marriage record: '{row.get('file_name', record_id)}'",
+                     record_type="marriage_record", record_id=record_id, file_name=row.get("file_name"))
 
         resolved = resolve_file_path(row)
         pdf_data = None
@@ -2890,7 +2939,7 @@ def archive_record(record_id):
 
         # Audit trail: every archive action is logged.
         record_action(
-            "ARCHIVE",
+            "RECORD_ARCHIVED",
             f"Archived marriage record: '{row.get('file_name', record_id)}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": row.get("file_name")},
@@ -2934,7 +2983,7 @@ def restore_record(record_id):
         # Audit trail: every restore action is logged, so an unexpected call
         # (e.g. a frontend regression) is visible immediately.
         record_action(
-            "RESTORE",
+            "RECORD_RESTORED",
             f"Restored marriage record: '{row.get('file_name', record_id)}'",
             username=get_user(),
             meta={"record_id": record_id, "file_name": row.get("file_name")},
@@ -2964,6 +3013,8 @@ def update_spouses(record_id):
         update_payload["updated_at"] = now_ph().isoformat()
 
         supabase.table("marriage_records").update(update_payload).eq("id", record_id).execute()
+        _audit_vital("SPOUSES_UPDATED", "Updated spouse names on marriage record",
+                     record_type="marriage_record", record_id=record_id)
         return jsonify({"success": True}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3059,6 +3110,10 @@ def complete_transaction():
         if not insert_res.data:
             return jsonify({"error": "Failed to save transaction."}), 500
         transaction_id = insert_res.data[0]["id"]
+        _audit_vital("TRANSACTION_COMPLETED", f"Marriage transaction completed — {record_status}",
+                     record_type="marriage_record", record_id=record_id,
+                     meta={"transaction_id": transaction_id, "payment_amount": payment_amount,
+                           "payment_reference": payment_reference})
         invalidate_analytics_cache("marriage_records")  # analytics cache
 
         # NOTIFICATION: only when the record was FOUND and it matches an
