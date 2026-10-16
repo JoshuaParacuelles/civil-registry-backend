@@ -33,20 +33,30 @@ AUDIT_VIEWER_ROLES = {"Administrator", "Auditor"}
 # Keep these names in sync with the actions the routes actually record.
 # The frontend groups the action filter by these categories.
 AUDIT_ACTION_CATALOG = {
-    "Authentication": ["LOGIN_SUCCESS", "LOGIN_FAILED", "ACCOUNT_LOCKED", "LOGOUT", "SESSION_EXPIRED"],
+    "Authentication": ["LOGIN_SUCCESS", "LOGIN_FAILED", "ACCOUNT_LOCKED", "ACCOUNT_UNLOCKED",
+                       "LOGOUT", "SESSION_EXPIRED"],
     "Documents": ["BIRTH_RECORD_VIEWED", "MARRIAGE_RECORD_VIEWED", "DEATH_RECORD_VIEWED",
                   "BIRTH_PDF_UPLOADED", "MARRIAGE_PDF_UPLOADED", "DEATH_PDF_UPLOADED",
-                  "PDF_VIEWED", "PDF_DOWNLOADED"],
+                  "PDF_VIEWED", "PDF_DOWNLOADED",
+                  "RECORD_SEARCHED", "RECORD_ARCHIVED", "RECORD_RESTORED",
+                  "RECORD_DELETED_PERMANENTLY", "RELATIVES_UPDATED", "SPOUSES_UPDATED"],
+    "Transactions": ["TRANSACTION_COMPLETED", "PAYMENT_RECORDED"],
     "Document Tracking": ["DOCUMENT_CREATED", "DOCUMENT_ASSIGNED", "DOCUMENT_ARCHIVED",
                           "DOCUMENT_RESTORED", "DOCUMENT_REJECTED", "DOCUMENT_COMMENT_ADDED",
                           "DOCUMENT_DELETED_PERMANENTLY"],
     "Registration Workflow": ["DOCUMENT_STEP_UPDATED", "DOCUMENT_STEP_ASSIGNED",
                               "REGISTRY_NUMBER_ASSIGNED", "DOCUMENT_RELEASED"],
-    "Personnel": ["PERSONNEL_ADDED", "PERSONNEL_REMOVED"],
-    "Roles": ["ROLE_CREATED", "ROLE_UPDATED", "ROLE_DELETED"],
-    "Accounts": ["ACCOUNT_UPDATED", "PASSWORD_CHANGED"],
+    "Personnel": ["PERSONNEL_ADDED", "PERSONNEL_REMOVED", "PERSONNEL_VIEWED"],
+    "Roles": ["ROLES_VIEWED", "ROLE_CREATED", "ROLE_UPDATED", "ROLE_DELETED",
+              "ADMINISTRATORS_UPDATED"],
+    "Accounts": ["ACCOUNT_CREATED", "ACCOUNT_UPDATED", "PASSWORD_CHANGED", "PASSWORD_RESET",
+                 "OFFLINE_ACCOUNTS_EXPORTED"],
+    "Maintenance": ["ORPHAN_FILES_REMOVED"],
     "Audit": ["AUDIT_LOG_VIEWED", "AUDIT_LOG_EXPORTED", "AUDIT_ACCESS_DENIED", "ACCESS_DENIED"],
 }
+
+# Flattened set used to warn when code writes an action the dropdown can't filter.
+_KNOWN_ACTIONS = {action for actions in AUDIT_ACTION_CATALOG.values() for action in actions}
 
 
 def _current_role():
@@ -246,6 +256,11 @@ def record_action(
         status = str(status or "SUCCESS").upper()
         if status not in _VALID_STATUSES:
             status = "FAILED"
+        if action not in _KNOWN_ACTIONS:
+            _logger.warning(
+                "[AUDIT] '%s' is not in AUDIT_ACTION_CATALOG; stored but not filterable",
+                action,
+            )
 
         supabase.table("audit_logs").insert({
             "username":      username or "System",
