@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from supabase_client import supabase
+from auth.offline_record import build_offline_record
 
 login_bp = Blueprint('login', __name__)
 
@@ -301,21 +302,25 @@ def safe_record_action(user_id, action, details=None, status=None):
         return None
 
 
-def get_roles_and_permissions(username):
-    """
-    Look up role names + flattened permission set for a username.
-    user_roles is keyed by 'username', NOT 'user_id'.
-    """
+def get_roles_and_permissions(username, category=None):
+    """Role names + permission set for a username. When `category` is given,
+    only that credential's role is counted, so each password unlocks exactly
+    its own category's permissions."""
     role_names = []
     permissions = set()
+
+    def _fetch(with_category):
+        q = supabase.table('user_roles').select('role_id, roles(*)').eq('username', username)
+        if with_category and category:
+            q = q.eq('category', category)
+        return q.execute().data or []
+
     try:
-        roles_response = (
-            supabase.table('user_roles')
-            .select('role_id, roles(*)')
-            .eq('username', username)
-            .execute()
-        )
-        user_roles = roles_response.data or []
+        try:
+            user_roles = _fetch(True)
+        except Exception:
+            # user_roles.category not migrated yet: use every row.
+            user_roles = _fetch(False)
         print(f"[LOGIN] Found {len(user_roles)} role(s) for '{username}'")
 
         for ur in user_roles:
@@ -348,6 +353,37 @@ def resolve_is_admin(username, permissions):
     if username and username.lower() == RESERVED_ADMIN_USERNAME:
         return True
     return bool(permissions & ADMIN_ONLY_MODULES)
+
+
+def _pick_credential_row(rows, password):
+    """A username can have one users row per category, each with its own
+    password. Return the row whose password matches, or the first row with
+    matched=False if none match."""
+    for row in rows:
+        stored = row.get(PASSWORD_COLUMN)
+        if stored and verify_password(password, stored):
+            return row, True
+    return (rows[0] if rows else None), False
+
+
+def _store_offline_record(user, password, role_names, permissions, is_admin_flag):
+    """Save the encrypted offline unlock record. This is possible only here,
+    because this is the moment the plaintext password is known."""
+    try:
+        profile = {
+            "id": user["id"],
+            "username": user["username"],
+            "category": user.get("category"),
+            "is_admin": bool(is_admin_flag),
+            "roles": list(role_names),
+            "permissions": sorted(permissions),
+        }
+        record = build_offline_record(password, profile)
+        supabase.table("users").update(
+            {"offline_record": record}
+        ).eq("id", user["id"]).execute()
+    except Exception as e:
+        print(f"[OFFLINE RECORD] could not store for '{user.get('username')}': {e}")
 
 
 @login_bp.route('/api/login', methods=['POST'])
@@ -406,7 +442,7 @@ def login():
                 "message": "Invalid username or password"
             }), 401
 
-        user = users[0]
+        user, _matched = _pick_credential_row(users, password)
 
         if PASSWORD_COLUMN not in user:
             print(f"[LOGIN ERROR] Expected '{PASSWORD_COLUMN}' column not found on users row: {list(user.keys())}")
@@ -491,7 +527,7 @@ def login():
             }), 401
 
         # Get roles/permissions BEFORE building the session
-        role_names, permissions = get_roles_and_permissions(user['username'])
+        role_names, permissions = get_roles_and_permissions(user['username'], user.get('category'))
         is_admin_flag = resolve_is_admin(user['username'], permissions)
 
         if is_admin_flag:
@@ -502,6 +538,7 @@ def login():
 
         # Refresh the local offline cache (hash only) after every good login
         _save_local_user(user, role_names, permissions)
+        _store_offline_record(user, password, role_names, permissions, is_admin_flag)
 
         # ============================================
         # SUCCESSFUL LOGIN - SET SESSION
@@ -554,7 +591,8 @@ def login():
             "is_admin": is_admin_flag,
             "is_locked": False,
             "roles": role_names,
-            "permissions": list(permissions)
+            "permissions": list(permissions),
+            "category": user.get("category"),
         }
 
         print(f"[LOGIN] Login successful for {username}")
@@ -691,7 +729,7 @@ def get_session():
 
             user = response.data[0]
 
-            role_names, permissions = get_roles_and_permissions(user['username'])
+            role_names, permissions = get_roles_and_permissions(user['username'], user.get('category'))
             is_admin_flag = resolve_is_admin(user['username'], permissions)
 
             if is_admin_flag:
