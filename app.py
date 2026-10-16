@@ -9,7 +9,6 @@ from flask import Flask, session, jsonify, request, g
 from flask_cors import CORS
 from flask_compress import Compress
 from routes.sync import register_offline_replay
-from routes.offline_credentials import offline_credentials_bp
 import time
 try:
     from supabase_client import supabase
@@ -146,7 +145,6 @@ register_offline_replay(app)
 app.config["DB"] = None
 app.config["DB_CONFIG"] = None
 app.config["SUPABASE"] = supabase
-app.register_blueprint(offline_credentials_bp)
 app.register_blueprint(login_bp)
 app.register_blueprint(changepass_bp)
 app.register_blueprint(birth_bp)
