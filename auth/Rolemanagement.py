@@ -12,6 +12,7 @@ from security import audit_denial, require_admin
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash, check_password_hash
 
+from auth.offline_record import build_offline_record
 from supabase_client import supabase
 
 role_bp = Blueprint("role_management", __name__)
@@ -1185,6 +1186,12 @@ def assign_role():
         print(f"[ROLES] assign_role failed for '{username}' ({category}): {e!r}")
         return jsonify({"error": f"Could not assign role: {e}"}), 500
 
+    # Only when a NEW credential was created with this password. If the
+    # credential already existed, the submitted password was ignored by the
+    # server, so writing a record here would encrypt with the wrong password.
+    if account_created and password:
+        _write_offline_record(username, category, password, role)
+
     after_other = _other_category_rows(username, category)
     lost = [c for c in before_other if c not in after_other]
     if lost:
@@ -1225,6 +1232,41 @@ def _other_category_rows(username: str, category: str) -> dict:
     except Exception as e:
         print(f"[ROLES] _other_category_rows failed for '{username}': {e!r}")
         return {}
+
+
+def _write_offline_record(username, category, password, role):
+    """Store the encrypted offline record for one (username, category) credential.
+    The password must be the one the server just stored for that credential."""
+    perms = set(parse_permissions(role.get("permissions")))
+    is_admin_role = "role_management" in perms
+    permissions = perms | {"dashboard"}
+    if is_admin_role:
+        permissions.add("*")
+    profile = {
+        "username": username,
+        "category": category,
+        "roles": [role.get("name")],
+        "is_admin": is_admin_role,
+        "permissions": sorted(permissions),
+    }
+    try:
+        record = build_offline_record(password, profile)
+        q = supabase.table("users").update({"offline_record": record}).eq("username", username)
+        if _user_category_column_available():
+            q = q.eq("category", category)
+        _exec(q)
+    except Exception as e:
+        print(f"[OFFLINE RECORD] could not store for '{username}' ({category}): {e!r}")
+
+
+def _role_for_credential(username, category):
+    rows = _exec(
+        supabase.table("user_roles")
+        .select("role_id")
+        .eq("username", username)
+        .eq("category", category)
+    ).data or []
+    return get_role_by_id(rows[0]["role_id"]) if rows else None
 
 
 @role_bp.route("/api/user-roles/<username>", methods=["DELETE"])
@@ -1331,6 +1373,10 @@ def reset_password(username):
             "lock_time":      None,
             "lock_level":     0,
         }).eq("username", username).eq("category", category))
+
+        role = _role_for_credential(username, category)
+        if role:
+            _write_offline_record(username, category, password, role)
     else:
         # Pre-migration fallback: one shared account per username. `category`
         # is ignored rather than rejected.
@@ -1450,3 +1496,42 @@ def my_permissions():
         "is_admin":    "role_management" in combined,
     }
     return jsonify(payload)
+
+
+# --- OFFLINE ACCOUNTS EXPORT -------------------------------------------------
+
+@role_bp.route("/api/offline-accounts", methods=["GET"])
+@require_admin
+@audit_action("OFFLINE_ACCOUNTS_EXPORTED", resource_type="account")
+def offline_accounts():
+    """Encrypted offline records for every ACTIVE credential (one that still has
+    a user_roles row). Accounts that were disabled or whose role was removed are
+    left out, so the device drops them on the next sync."""
+    if not _category_column_available() or not _user_category_column_available():
+        return jsonify({"error": MIGRATION_REQUIRED_ERROR}), 500
+
+    assigned = _exec(
+        supabase.table("user_roles").select("username, category")
+    ).data or []
+    active = {(r["username"], r.get("category")) for r in assigned}
+
+    users = _exec(
+        supabase.table("users").select("username, category, offline_record")
+    ).data or []
+
+    accounts = []
+    for u in users:
+        key = (u["username"], u.get("category"))
+        if key not in active:
+            continue
+        accounts.append({
+            "username": u["username"],
+            "category": u.get("category"),
+            "offline_record": u.get("offline_record"),
+            # No record yet: this account must log in online once, or be reset.
+            "needs_reset": not u.get("offline_record"),
+        })
+
+    resp = jsonify({"accounts": accounts})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
