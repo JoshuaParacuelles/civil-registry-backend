@@ -421,47 +421,41 @@ def _fetch_paginated(table_name, preferred_columns, gte=None, order_col="id"):
     """
     Paginates through Supabase to fetch every matching row of `table_name`.
 
-    Tries `preferred_columns` first; if rejected (schema drift), retries once
-    with select(*). Transient socket errors are retried per page. Raises
-    RuntimeError if all attempts fail so the real cause is reported.
+    Uses `preferred_columns` only. A select('*') fallback is deliberately NOT
+    used: record tables hold base64 PDF blobs, so a wildcard select would pull
+    the entire archive into memory. Transient socket errors are retried per
+    page. Raises RuntimeError if the fetch fails so the real cause is reported.
     """
     batch_size = 1000
-    last_error = None
+    cols = preferred_columns
+    all_rows = []
+    offset = 0
+    try:
+        while True:
+            def build(offset=offset):
+                query = supabase.table(table_name).select(cols)
+                if gte:
+                    query = query.gte(*gte)
+                if order_col:
+                    query = query.order(order_col)
+                    if order_col != "id":
+                        query = query.order("id")
+                return query.range(offset, offset + batch_size - 1)
 
-    for cols in (preferred_columns, "*"):
-        all_rows = []
-        offset = 0
-        try:
-            while True:
-                def build(offset=offset, cols=cols):
-                    query = supabase.table(table_name).select(cols)
-                    if gte:
-                        query = query.gte(*gte)
-                    if order_col:
-                        query = query.order(order_col)
-                        if order_col != "id":
-                            query = query.order("id")
-                    return query.range(offset, offset + batch_size - 1)
-
-                res = _execute_with_retry(build, table_name)
-                data = res.data or []
-                all_rows.extend(data)
-                if len(data) < batch_size:
-                    break
-                offset += batch_size
-            return all_rows
-        except Exception as e:
-            last_error = e
-            print(f"[Analytics] Error fetching rows for {table_name} "
-                  f"with select('{cols}'): {e}")
-            continue
-
-    print(f"[Analytics] ERROR: could not fetch any rows for {table_name}; "
-          f"last error: {last_error}")
-    raise RuntimeError(
-        f"Could not read table '{table_name}' from Supabase "
-        f"(check credentials/RLS policies/network): {last_error}"
-    ) from last_error
+            res = _execute_with_retry(build, table_name)
+            data = res.data or []
+            all_rows.extend(data)
+            if len(data) < batch_size:
+                break
+            offset += batch_size
+        return all_rows
+    except Exception as e:
+        print(f"[Analytics] ERROR: could not fetch rows for {table_name} "
+              f"with select('{cols}'): {e}")
+        raise RuntimeError(
+            f"Could not read table '{table_name}' from Supabase "
+            f"(check credentials/RLS policies/network/column names): {e}"
+        ) from e
 
 
 def _fetch_paginated_safe(table_name, preferred_columns):
@@ -481,7 +475,7 @@ def fetch_all_rows(table_name):
     )
 
 
-def active_rows(table_name, include_archived=True):
+def active_rows(table_name):
     """Return all rows; archive state does not exclude analytics records."""
     return fetch_all_rows(table_name)
 
@@ -551,7 +545,7 @@ def _count_exact(table_name):
     return cached(("count", table_name), TTL_COUNT, load)
 
 
-def table_counts(table_name, include_archived=True):
+def table_counts(table_name):
     """Returns (total_count, today_count) without downloading whole tables."""
     total = _count_exact(table_name)
     start, end = _business_day_window()

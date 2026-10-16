@@ -3,7 +3,7 @@ from flask import Blueprint, request, jsonify, session
 from flask_cors import CORS
 import bcrypt
 from werkzeug.security import generate_password_hash, check_password_hash
-from logs.Audits import audit_action, set_audit_context
+from logs.Audits import audit_action, record_action, set_audit_context
 from supabase_client import supabase
 
 changepass_bp = Blueprint("changepass_bp", __name__)
@@ -146,8 +146,19 @@ def _supabase_error_response(e):
     return _err("Database error. Please try again.", "SERVER_ERROR", 500)
 
 
+def _log_password_event(status, description, username, *, resource_id=None, meta=None):
+    record_action(
+        "PASSWORD_CHANGED",
+        description,
+        username=username,
+        status=status,
+        resource_type="account",
+        resource_id=resource_id,
+        meta=meta,
+    )
+
+
 @changepass_bp.route("/api/change-password", methods=["POST"])
-@audit_action("PASSWORD_CHANGED", resource_type="account")
 def change_password():
     data = request.get_json(silent=True) or {}
 
@@ -162,12 +173,16 @@ def change_password():
         return _err("User not logged in", "NOT_LOGGED_IN", 401)
 
     if not current_password:
+        _log_password_event("FAILED", "Password change rejected: current password missing",
+                            current_username, meta={"reason": "missing_current_password"})
         return _err("Current password is required", "VALIDATION_ERROR", 400)
 
     try:
         res = supabase.table("users").select("id, username, password") \
             .eq("username", current_username).limit(1).execute()
     except Exception as e:
+        _log_password_event("FAILED", "Password change failed: database unavailable",
+                            current_username, meta={"reason": "database_error"})
         return _supabase_error_response(e)
 
     if not res.data:
@@ -176,19 +191,11 @@ def change_password():
     user = res.data[0]
     stored_password = user["password"]
     print(f"[change_password] fetched row for username='{user['username']}' id={user['id']}")
-    requested_username = (new_username or current_username).strip() or current_username
-    set_audit_context(
-        old_value={"username": current_username},
-        new_value={
-            "username": requested_username,
-            "password_change_requested": bool(new_password),
-        },
-        resource_id=user["id"],
-    )
 
-    password_ok = _verify_password(current_password, stored_password)
-
-    if not password_ok:
+    if not _verify_password(current_password, stored_password):
+        _log_password_event("FAILED", "Password change failed: current password incorrect",
+                            current_username, resource_id=user["id"],
+                            meta={"reason": "invalid_current_password"})
         return _err("Current password incorrect", "INVALID_PASSWORD", 403)
 
     if not new_username:
@@ -205,15 +212,27 @@ def change_password():
             existing = supabase.table("users").select("id") \
                 .eq("username", new_username).limit(1).execute()
         except Exception as e:
+            _log_password_event("FAILED", "Account update failed: database unavailable",
+                                current_username, resource_id=user["id"],
+                                meta={"reason": "database_error"})
             return _supabase_error_response(e)
         if existing.data:
+            _log_password_event("FAILED", "Account update failed: username already taken",
+                                current_username, resource_id=user["id"],
+                                meta={"reason": "username_taken"})
             return _err("Username already taken", "USERNAME_TAKEN", 409)
 
     final_password = stored_password
     if changing_password:
         if len(new_password) < 6:
+            _log_password_event("FAILED", "Password change rejected: password too short",
+                                current_username, resource_id=user["id"],
+                                meta={"reason": "password_too_short"})
             return _err("New password must be at least 6 characters", "VALIDATION_ERROR", 400)
         if new_password == current_password:
+            _log_password_event("FAILED", "Password change rejected: same as current password",
+                                current_username, resource_id=user["id"],
+                                meta={"reason": "password_unchanged"})
             return _err("New password must be different from current password", "VALIDATION_ERROR", 400)
         final_password = _hash_new_password(new_password)
 
@@ -223,15 +242,30 @@ def change_password():
             "password": final_password,
         }).eq("id", user["id"]).execute()
 
-        # user_roles.username is unique and keyed by string, not a
-        # stable user id — so renaming without this orphans the role
-        # row and permission checks silently fall back to no role.
+        # user_roles.username is keyed by string, so a rename must follow it.
         if changing_username:
             supabase.table("user_roles").update({
                 "username": new_username
             }).eq("username", current_username).execute()
     except Exception as e:
+        _log_password_event("FAILED", "Account update failed: database error",
+                            current_username, resource_id=user["id"],
+                            meta={"reason": "database_error"})
         return _supabase_error_response(e)
+
+    if changing_password:
+        _log_password_event("SUCCESS", "Password changed", new_username,
+                            resource_id=user["id"])
+    if changing_username:
+        record_action(
+            "ACCOUNT_UPDATED",
+            "Username changed",
+            username=new_username,
+            resource_type="account",
+            resource_id=user["id"],
+            old_value={"username": current_username},
+            new_value={"username": new_username},
+        )
 
     session["username"] = new_username
 
@@ -243,50 +277,66 @@ def change_password():
 
 
 @changepass_bp.route("/api/change-module-password", methods=["POST"])
-@audit_action("MODULE_PASSWORD_CHANGED", resource_type="module_password")
 def change_module_password():
     data = request.get_json(silent=True) or {}
 
     module     = (data.get("module") or "").strip()
     current_pw = (data.get("currentPassword") or "").strip()
     new_pw     = (data.get("newPassword") or "").strip()
+    label      = VALID_MODULES.get(module, module)
+
+    def _fail(description, reason, http_status, message, code):
+        record_action(
+            "PASSWORD_CHANGED",
+            f"{label} password change failed: {description}",
+            username=session.get("username"),
+            status="FAILED",
+            resource_type="module_password",
+            resource_id=module,
+            meta={"module": module, "reason": reason},
+        )
+        return _err(message, code, http_status)
 
     if module not in VALID_MODULES:
         return _err("Unknown module.", "VALIDATION_ERROR", 400)
 
     if not current_pw:
-        return _err("Current password is required.", "VALIDATION_ERROR", 400)
+        return _fail("current password missing", "missing_current_password", 400,
+                     "Current password is required.", "VALIDATION_ERROR")
 
     if not new_pw:
-        return _err("New password is required.", "VALIDATION_ERROR", 400)
+        return _fail("new password missing", "missing_new_password", 400,
+                     "New password is required.", "VALIDATION_ERROR")
 
     if len(new_pw) < 6:
-        return _err("New password must be at least 6 characters.", "VALIDATION_ERROR", 400)
+        return _fail("password too short", "password_too_short", 400,
+                     "New password must be at least 6 characters.", "VALIDATION_ERROR")
 
     if current_pw == new_pw:
-        return _err("New password must differ from current.", "VALIDATION_ERROR", 400)
+        return _fail("same as current password", "password_unchanged", 400,
+                     "New password must differ from current.", "VALIDATION_ERROR")
 
     try:
         res = supabase.table("module_passwords").select("password_hash") \
             .eq("module_key", module).limit(1).execute()
     except Exception as e:
-        return _supabase_error_response(e)
+        return _fail("database unavailable", "database_error", 500,
+                     "Database error. Please try again.", "SERVER_ERROR")
 
     if not res.data:
-        return _err(
-            f"No password record found for '{VALID_MODULES[module]}'. "
-            "Please seed module_passwords for this module first.",
-            "NOT_FOUND",
-            404,
-        )
+        return _fail("no password record", "no_record", 404,
+                     f"No password record found for '{label}'. "
+                     "Please seed module_passwords for this module first.", "NOT_FOUND")
 
     stored_hash = res.data[0]["password_hash"]
 
     if not stored_hash or not str(stored_hash).startswith("$2"):
-        return _err("Password record is invalid or corrupted.", "SERVER_ERROR", 500)
+        return _fail("stored password invalid", "invalid_record", 500,
+                     "Password record is invalid or corrupted.", "SERVER_ERROR")
 
     if not _verify_bcrypt(current_pw, stored_hash):
-        return _err("Current password is incorrect.", "INVALID_PASSWORD", 403)
+        return _fail("current password incorrect", "invalid_current_password", 403,
+                     "Current password is incorrect.", "INVALID_PASSWORD")
 
     new_hash = _hash_bcrypt(new_pw)
 
@@ -295,9 +345,17 @@ def change_module_password():
             "password_hash": new_hash
         }).eq("module_key", module).execute()
     except Exception as e:
-        return _supabase_error_response(e)
+        return _fail("database write failed", "database_error", 500,
+                     "Database error. Please try again.", "SERVER_ERROR")
 
-    label = VALID_MODULES.get(module, module)
+    record_action(
+        "PASSWORD_CHANGED",
+        f"{label} password changed",
+        username=session.get("username"),
+        resource_type="module_password",
+        resource_id=module,
+        meta={"module": module},
+    )
     return jsonify({
         "success": True,
         "message": f"{label} password updated successfully."

@@ -643,7 +643,7 @@ def init_roles_db():
 
 @role_bp.route("/api/roles", methods=["GET"])
 @require_admin
-@audit_action("ROLES_VIEWED", resource_type="role")
+@audit_action("ROLES_VIEWED", resource_type="role", dedupe_window_seconds=300)
 def get_roles():
     resp = _exec(supabase.table("roles").select("*").order("id"))
     rows = resp.data or []
@@ -661,7 +661,7 @@ def get_roles():
 
 @role_bp.route("/api/roles-list", methods=["GET"])
 @require_admin
-@audit_action("ROLES_VIEWED", resource_type="role")
+@audit_action("ROLES_VIEWED", resource_type="role", dedupe_window_seconds=300)
 def get_roles_list():
     resp = _exec(supabase.table("roles").select("id, name, permissions").order("name"))
     rows = resp.data or []
@@ -676,7 +676,7 @@ def get_roles_list():
 
 @role_bp.route("/api/roles/<int:role_id>", methods=["GET"])
 @require_admin
-@audit_action("ROLE_VIEWED", resource_type="role")
+@audit_action("ROLES_VIEWED", resource_type="role", dedupe_window_seconds=300)
 def get_role(role_id):
     row = get_role_by_id(role_id)
     if not row:
@@ -875,7 +875,7 @@ def delete_role(role_id):
 
 @role_bp.route("/api/modules", methods=["GET"])
 @require_admin
-@audit_action("ADMIN_MODULES_VIEWED", resource_type="access_control")
+@audit_action("ROLES_VIEWED", resource_type="access_control", dedupe_window_seconds=300)
 def get_modules():
     return jsonify({
         "all":        ALL_MODULES,
@@ -887,7 +887,7 @@ def get_modules():
 
 @role_bp.route("/api/administrators", methods=["GET"])
 @require_admin
-@audit_action("ADMINISTRATORS_VIEWED", resource_type="account")
+@audit_action("PERSONNEL_VIEWED", resource_type="account", dedupe_window_seconds=300)
 def get_administrators():
     """Current holders of the (capped) Administrator role, excluding the
     reserved bootstrap 'admin' account."""
@@ -957,7 +957,7 @@ def set_administrators():
 
 @role_bp.route("/api/user-roles", methods=["GET"])
 @require_admin
-@audit_action("USER_ROLES_VIEWED", resource_type="user_role")
+@audit_action("PERSONNEL_VIEWED", resource_type="user_role", dedupe_window_seconds=300)
 def get_user_roles():
     select_cols = "id, username, category, assigned_at, roles(id, name, permissions)"
     if not _category_column_available():
@@ -1017,7 +1017,7 @@ def get_user_roles():
 
 @role_bp.route("/api/user-roles", methods=["POST"])
 @require_admin
-@audit_action("USER_ROLE_ASSIGNED", resource_type="user_role")
+@audit_action("PERSONNEL_ADDED", resource_type="user_role")
 def assign_role():
     data     = request.json or {}
     username = (data.get("username") or "").strip()
@@ -1271,7 +1271,7 @@ def _role_for_credential(username, category):
 
 @role_bp.route("/api/user-roles/<username>", methods=["DELETE"])
 @require_admin
-@audit_action("USER_ROLE_REMOVED", resource_type="user_role")
+@audit_action("PERSONNEL_REMOVED", resource_type="user_role")
 def remove_user_role(username):
     caller = session.get("username")
     if caller == username:
