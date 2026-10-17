@@ -6,6 +6,7 @@ import uuid
 import time
 import base64
 import hashlib
+from types import SimpleNamespace
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -13,7 +14,7 @@ from flask import Blueprint, jsonify, request, send_file, session, g, has_reques
 from werkzeug.utils import secure_filename
 from pypdf import PdfReader
 from postgrest.exceptions import APIError
-
+from routes.record_classifier import classify_record_pdf
 from supabase_client import supabase
 from routes.notification import push_notification
 from routes.analytics import invalidate_analytics_cache  # analytics cache
@@ -40,26 +41,147 @@ def now_ph() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
 
 
+# =============================================================================
+# TRANSIENT NETWORK RETRY
+#
+# On Windows the Supabase client reuses one HTTP connection and intermittently
+# raises WinError 10035 (WSAEWOULDBLOCK). The error is temporary: retrying the
+# same call succeeds. Only network-level errors are retried; validation and
+# constraint errors are raised immediately.
+# =============================================================================
+
+_TRANSIENT_MARKERS = (
+    "10035", "non-blocking socket", "ReadError", "WriteError",
+    "RemoteProtocolError", "ConnectError", "ConnectTimeout",
+    "ReadTimeout", "PoolTimeout", "ConnectionResetError",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}"
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _retry_transient(fn, attempts: int = 4, base_delay: float = 0.4):
+    """Call fn(). Retry only on transient network errors."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == attempts - 1 or not _is_transient(e):
+                raise
+            time.sleep(base_delay * (2 ** attempt))
+
+
+def _insert_once(table: str, payload: dict, name_col: str,
+                 since_col: str = "uploaded_at", attempts: int = 4):
+    """Insert a row, retrying only transient network errors.
+
+    The insert can commit on the server even when the response is lost. Before
+    each retry, look for a row with the same name stamped at or after this
+    request's upload time. If it exists, reuse it, so a retry never creates a
+    duplicate. If that lookup itself fails, the error is raised rather than
+    risking a second insert.
+    """
+    started = payload[since_col]
+    for attempt in range(attempts):
+        try:
+            return supabase.table(table).insert(payload).execute()
+        except Exception as e:
+            if not _is_transient(e) or attempt == attempts - 1:
+                raise
+            time.sleep(0.4 * (2 ** attempt))
+            landed = supabase.table(table).select("*") \
+                .eq(name_col, payload[name_col]) \
+                .gte(since_col, started) \
+                .limit(1).execute().data
+            if landed:
+                return SimpleNamespace(data=landed)
+
+
+# =============================================================================
+# BULK DELETE (Birth / Marriage / Death)
+#
+# One request per batch instead of one request per record. The DELETE is
+# retried on transient network errors, then the rows are looked up again, so
+# the reported result matches what is really gone.
+# =============================================================================
+
+MAX_BULK_DELETE = 500
+
+
+def _parse_bulk_ids(body):
+    raw = (body or {}).get("ids")
+    if not isinstance(raw, list) or not raw or len(raw) > MAX_BULK_DELETE:
+        return None
+    try:
+        return sorted({int(i) for i in raw})
+    except (TypeError, ValueError):
+        return None
+
+
+def _bulk_delete_rows(table, ids, select_cols="id"):
+    """Returns (deleted_rows, failed_ids)."""
+    existing = _retry_transient(
+        lambda: supabase.table(table).select(select_cols).in_("id", ids).execute()
+    ).data or []
+
+    if existing:
+        target = [r["id"] for r in existing]
+        _retry_transient(
+            lambda: supabase.table(table).delete().in_("id", target).execute()
+        )
+
+    still_there = _retry_transient(
+        lambda: supabase.table(table).select("id").in_("id", ids).execute()
+    ).data or []
+    remaining = {r["id"] for r in still_there}
+
+    deleted_rows = [r for r in existing if r["id"] not in remaining]
+    deleted = {r["id"] for r in deleted_rows}
+    failed_ids = [i for i in ids if i not in deleted]
+    return deleted_rows, failed_ids
+
+
 def get_user():
     """Username of the logged-in user ("System" only if there is no session,
     which the login hook below now prevents for these blueprints)."""
     return session.get("username", "System")
 
 
+def _safe_record_action(*args, **kwargs):
+    """record_action() that can never turn an already-completed database
+    change into an HTTP error. Transient network errors are retried first."""
+    try:
+        _retry_transient(lambda: record_action(*args, **kwargs))
+    except Exception as e:
+        print(f"[AUDIT] could not write audit entry: {e}")
+
+
+def _safe_invalidate(table_name):
+    """Cache invalidation that can never fail a request after a DB write."""
+    try:
+        invalidate_analytics_cache(table_name)
+    except Exception as e:
+        print(f"[ANALYTICS] cache invalidation failed for {table_name}: {e}")
+
+
 def _audit_vital(action, description, *, record_type, record_id=None,
                  file_name=None, status="SUCCESS", meta=None):
-    """Vital-records audit entry. record_action() already swallows its own errors."""
-    record_action(
-        action,
-        description,
-        username=get_user(),
-        status=status,
-        resource_type=record_type,
-        resource_id=record_id,
-        meta={"record_id": record_id, "file_name": file_name, **(meta or {})},
-        ip=client_ip(),
-    )
-
+    """Vital-records audit entry. Never raises."""
+    try:
+        _safe_record_action(
+            action,
+            description,
+            username=get_user(),
+            status=status,
+            resource_type=record_type,
+            resource_id=record_id,
+            meta={"record_id": record_id, "file_name": file_name, **(meta or {})},
+            ip=client_ip(),
+        )
+    except Exception as e:
+        print(f"[AUDIT] could not build audit entry: {e}")
 
 # =============================================================================
 # ONLINE-REQUEST DETECTION — shared by Birth/Death/Marriage "complete
@@ -402,7 +524,10 @@ def parse_death_certificate_from_bytes(pdf_bytes: bytes) -> Dict:
 
 @death_bp.route("/records", methods=["GET"])
 def get_records():
+    # Strict "false" so archived rows (TRUE or NULL) appear only under
+    # /archived, matching the Birth and Marriage active lists.
     res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS) \
+        .eq("is_archived", "false") \
         .order("uploaded_at", desc=True).order("id", desc=True).execute()
     return jsonify(res.data)
 
@@ -428,28 +553,19 @@ def get_archived_records():
 
 @death_bp.route("/records", methods=["POST"])
 def upload_record():
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded."}), 400
+    return _dispatch_pdf_upload("death")
 
-    file = request.files["file"]
-    if not file or not file.filename:
-        return jsonify({"error": "No selected file."}), 400
-    if not death_allowed_file(file.filename):
-        return jsonify({"error": "Only PDF files are allowed."}), 400
 
-    file_bytes = file.read()
-    if not file_bytes:
-        return jsonify({"error": "Uploaded file is empty."}), 400
-    if len(file_bytes) > DEATH_MAX_FILE_SIZE_BYTES:
-        return jsonify({"error": f"File exceeds {DEATH_MAX_FILE_SIZE_MB} MB limit."}), 400
-
-    original_file_name = file.filename.strip()
+def _store_death_pdf(pdf_bytes, original_filename, section, form):
+    """Save one death PDF. Returns (response_dict, http_status)."""
+    original_file_name = original_filename.strip()
     file_stem          = safe_stem(original_file_name)
 
+    # Phase 1: parse + insert. Failures here mean nothing was saved.
     try:
-        parsed       = parse_death_certificate_from_bytes(file_bytes)
+        parsed       = parse_death_certificate_from_bytes(pdf_bytes)
         current_time = now_dt().isoformat()
-        pdf_b64      = base64.b64encode(file_bytes).decode("utf-8")
+        pdf_b64      = base64.b64encode(pdf_bytes).decode("utf-8")
 
         insert_payload = {
             "file_name": file_stem,
@@ -465,22 +581,31 @@ def upload_record():
             "created_at": current_time,
             "updated_at": current_time,
         }
-
-        res = supabase.table("death_records").insert(insert_payload).execute()
-
-        if not res.data:
-            return jsonify({"error": "Failed to insert record."}), 500
-
-        record_id = res.data[0]["id"]
-        _audit_vital("DEATH_PDF_UPLOADED", f"Uploaded death record PDF: '{file_stem}'",
-                     record_type="death_record", record_id=record_id, file_name=file_stem)
-        invalidate_analytics_cache("death_records")  # analytics cache
-
-        fetch_res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS).eq("id", record_id).single().execute()
-        return jsonify(fetch_res.data), 201
-
+        res = _insert_once("death_records", insert_payload, "original_file_name")
     except Exception as e:
-        return jsonify({"error": f"Failed to process PDF: {str(e)}"}), 500
+        return {"error": f"Failed to process PDF: {str(e)}"}, 500
+
+    if not res.data:
+        return {"error": "Failed to insert record."}, 500
+
+    # Phase 2: the record IS saved. Nothing below may turn this into an error.
+    saved = res.data[0]
+    record_id = saved.get("id")
+
+    _audit_vital("DEATH_PDF_UPLOADED", f"Uploaded death record PDF: '{file_stem}'",
+                 record_type="death_record", record_id=record_id, file_name=file_stem)
+    _safe_invalidate("death_records")
+
+    response_row = {k: v for k, v in saved.items() if k != "pdf_file"}
+    try:
+        fetch_res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS) \
+            .eq("id", record_id).single().execute()
+        if fetch_res.data:
+            response_row = fetch_res.data
+    except Exception as e:
+        print(f"[DEATH] saved record {record_id} but re-read failed: {e}")
+
+    return response_row, 201
 
 
 @death_bp.route("/records/<int:record_id>", methods=["GET"])
@@ -588,19 +713,44 @@ def restore_record(record_id: int):
 
 @death_bp.route("/records/<int:record_id>", methods=["DELETE"])
 def delete_record(record_id: int):
+    # Only the database delete decides success or failure.
     try:
         res = supabase.table("death_records").delete().eq("id", record_id).execute()
-        if not res.data:
-            return jsonify({"error": "Record not found."}), 404
-        file_name = res.data[0].get("file_name")
-        invalidate_analytics_cache("death_records")  # analytics cache
-
-        _audit_vital("RECORD_DELETED_PERMANENTLY",
-                     f"Permanently deleted death record: '{file_name or record_id}'",
-                     record_type="death_record", record_id=record_id, file_name=file_name)
-        return jsonify({"success": True, "message": "Record deleted permanently."}), 200
     except Exception as e:
         return jsonify({"error": f"Failed to delete record: {str(e)}"}), 500
+
+    if not res.data:
+        return jsonify({"error": "Record not found."}), 404
+
+    file_name = res.data[0].get("file_name")
+
+    # The row is already gone; side effects below must not change the response.
+    _safe_invalidate("death_records")
+    _audit_vital("RECORD_DELETED_PERMANENTLY",
+                 f"Permanently deleted death record: '{file_name or record_id}'",
+                 record_type="death_record", record_id=record_id, file_name=file_name)
+    return jsonify({"success": True, "message": "Record deleted permanently."}), 200
+
+
+@death_bp.route("/records/bulk-delete", methods=["POST"])
+def bulk_delete_death():
+    ids = _parse_bulk_ids(request.get_json(silent=True))
+    if ids is None:
+        return jsonify({"error": f"Send 1 to {MAX_BULK_DELETE} numeric ids."}), 400
+    try:
+        deleted_rows, failed_ids = _bulk_delete_rows("death_records", ids)
+    except Exception as e:
+        return jsonify({"error": f"Failed to delete records: {e}"}), 500
+
+    deleted_ids = [r["id"] for r in deleted_rows]
+    _safe_invalidate("death_records")
+    _audit_vital(
+        "RECORD_DELETED_PERMANENTLY",
+        f"Permanently deleted {len(deleted_ids)} death record(s) in bulk",
+        record_type="death_record",
+        meta={"record_ids": deleted_ids, "failed_count": len(failed_ids)},
+    )
+    return jsonify({"success": True, "deleted_ids": deleted_ids, "failed_ids": failed_ids}), 200
 
 
 @death_bp.route("/records/complete", methods=["POST"])
@@ -1148,39 +1298,28 @@ def get_archived_records():
 
 @birth_bp.route('/api/birth/records', methods=['POST'])
 def upload_record():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file provided"}), 400
+    return _dispatch_pdf_upload("birth")
 
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No file selected"}), 400
-    if not file.filename.lower().endswith('.pdf'):
-        return jsonify({"error": "Only PDF files are allowed"}), 400
 
+def _store_birth_pdf(pdf_bytes, original_filename, section, form):
+    """Save one birth PDF. Returns (response_dict, http_status)."""
     try:
-        pdf_bytes = file.read()
-
         if not pdf_bytes.startswith(b'%PDF'):
-            return jsonify({"error": "Uploaded file does not appear to be a valid PDF."}), 400
+            return {"error": "Uploaded file does not appear to be a valid PDF."}, 400
 
-        file_name = os.path.splitext(secure_filename(file.filename))[0]
-
+        file_name = os.path.splitext(secure_filename(original_filename))[0]
         file_size_bytes = len(pdf_bytes)
-        file_size_kb    = round(file_size_bytes / 1024, 2)
-        file_size_mb    = round(file_size_bytes / (1024 * 1024), 2)
-
-        if file_size_mb > 20:
-            return jsonify({"error": "File exceeds the 20 MB limit."}), 400
+        file_size_kb = round(file_size_bytes / 1024, 2)
+        file_size_mb = round(file_size_bytes / (1024 * 1024), 2)
 
         extracted = extract_birth_data_from_pdf(pdf_bytes)
 
-        father_first_name  = _clean_title(request.form.get('father_first_name'))  or extracted["father_first_name"]
-        father_middle_name = _clean_title(request.form.get('father_middle_name')) or extracted["father_middle_name"]
-        father_last_name   = _clean_title(request.form.get('father_last_name'))   or extracted["father_last_name"]
-
-        mother_first_name  = _clean_title(request.form.get('mother_first_name'))  or extracted["mother_first_name"]
-        mother_middle_name = _clean_title(request.form.get('mother_middle_name')) or extracted["mother_middle_name"]
-        mother_last_name   = _clean_title(request.form.get('mother_last_name'))   or extracted["mother_last_name"]
+        father_first_name  = _clean_title(form.get('father_first_name'))  or extracted["father_first_name"]
+        father_middle_name = _clean_title(form.get('father_middle_name')) or extracted["father_middle_name"]
+        father_last_name   = _clean_title(form.get('father_last_name'))   or extracted["father_last_name"]
+        mother_first_name  = _clean_title(form.get('mother_first_name'))  or extracted["mother_first_name"]
+        mother_middle_name = _clean_title(form.get('mother_middle_name')) or extracted["mother_middle_name"]
+        mother_last_name   = _clean_title(form.get('mother_last_name'))   or extracted["mother_last_name"]
 
         extracted["father_first_name"]  = father_first_name
         extracted["father_middle_name"] = father_middle_name
@@ -1192,9 +1331,6 @@ def upload_record():
         extracted["mother_full_name"]   = _build_full_name(mother_first_name, mother_middle_name, mother_last_name)
 
         now = now_ph().isoformat()
-
-        # Store a single, clean base64 string (pdf_data must be a `text`
-        # column, not bytea — see the note above _looks_like_pdf).
         pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
 
         insert_payload = {
@@ -1227,20 +1363,20 @@ def upload_record():
         }
 
         try:
-            resp = supabase.table("birth_records").insert(insert_payload).execute()
+            resp = _insert_once("birth_records", insert_payload, "file_name")
         except APIError as e:
             # Unique-constraint violation on file_name -> 409.
             if "file_name" in str(e) or "duplicate" in str(e).lower():
-                return jsonify({"error": f"'{file_name}' already exists."}), 409
+                return {"error": f"'{file_name}' already exists."}, 409
             raise
 
         record_id = resp.data[0]["id"] if resp.data else None
-        invalidate_analytics_cache("birth_records")  # analytics cache
+        _safe_invalidate("birth_records")  # analytics cache
 
         # No notification on upload — notifications fire only when a
         # matching record is found and a transaction is completed.
 
-        record_action(
+        _safe_record_action(
             "BIRTH_PDF_UPLOADED",
             f"Uploaded birth record to archive: '{file_name}'",
             username=get_user(),
@@ -1255,7 +1391,7 @@ def upload_record():
             ip=request.remote_addr
         )
 
-        return jsonify({
+        return {
             "message": "Record uploaded to archive successfully",
             "id": record_id,
             "file_name": file_name,
@@ -1273,10 +1409,10 @@ def upload_record():
             "mother_full_name":   extracted["mother_full_name"],
             "extraction_status":  extracted["extraction_status"],
             "archived_at": now,
-        }), 201
+        }, 201
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return {"error": str(e)}, 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1604,20 +1740,41 @@ def delete_record(record_id):
         file_name = rows[0]['file_name']
 
         supabase.table("birth_records").delete().eq("id", record_id).execute()
-        invalidate_analytics_cache("birth_records")  # analytics cache
-
-        record_action(
-            "RECORD_DELETED_PERMANENTLY",
-            f"Permanently deleted birth record: '{file_name}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": file_name},
-            ip=request.remote_addr
-        )
-
-        return jsonify({"message": "Record deleted successfully"})
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+    # The row is already deleted; audit/cache problems must not fail the request.
+    _safe_invalidate("birth_records")
+    _safe_record_action(
+        "RECORD_DELETED_PERMANENTLY",
+        f"Permanently deleted birth record: '{file_name}'",
+        username=get_user(),
+        meta={"record_id": record_id, "file_name": file_name},
+        ip=request.remote_addr
+    )
+
+    return jsonify({"message": "Record deleted successfully"})
+
+
+@birth_bp.route('/api/birth/records/bulk-delete', methods=['POST'])
+def bulk_delete_birth():
+    ids = _parse_bulk_ids(request.get_json(silent=True))
+    if ids is None:
+        return jsonify({"error": f"Send 1 to {MAX_BULK_DELETE} numeric ids."}), 400
+    try:
+        deleted_rows, failed_ids = _bulk_delete_rows("birth_records", ids)
+    except Exception as e:
+        return jsonify({"error": f"Failed to delete records: {e}"}), 500
+
+    deleted_ids = [r["id"] for r in deleted_rows]
+    _safe_invalidate("birth_records")
+    _audit_vital(
+        "RECORD_DELETED_PERMANENTLY",
+        f"Permanently deleted {len(deleted_ids)} birth record(s) in bulk",
+        record_type="birth_record",
+        meta={"record_ids": deleted_ids, "failed_count": len(failed_ids)},
+    )
+    return jsonify({"success": True, "deleted_ids": deleted_ids, "failed_ids": failed_ids}), 200
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2641,17 +2798,17 @@ def get_archived_records():
 
 @marriage_bp.route("/archived", methods=["POST"])
 def upload_archived_shortcut():
-    return _upload_pdf(target="archive")
+    return _dispatch_pdf_upload("marriage")
 
 
 @marriage_bp.route("/archived/upload", methods=["POST"])
 def upload_to_archive():
-    return _upload_pdf(target="archive")
+    return _dispatch_pdf_upload("marriage")
 
 
 @marriage_bp.route("/records", methods=["POST"])
 def upload_record():
-    return _upload_pdf(target="archive")
+    return _dispatch_pdf_upload("marriage")
 
 
 # =============================================================================
@@ -2721,12 +2878,12 @@ def _serve_pdf(record_id, as_attachment=False):
 # =============================================================================
 # SHARED DELETE HELPER (Marriage)
 #
-# FIX: removes EVERY on-disk copy that belongs to the record (both folders),
-# retries if the file is briefly locked, and tells the caller when a file
-# could not be removed instead of failing silently.
+# Step 1: the database delete decides success or failure.
+# Step 2: file cleanup and audit run afterwards and cannot change the response.
 # =============================================================================
 
 def _delete_record(record_id):
+    # ── Step 1: the database row is the source of truth. ──
     try:
         res = supabase.table("marriage_records").select("*").eq("id", record_id).limit(1).execute()
         if not res.data:
@@ -2735,69 +2892,89 @@ def _delete_record(record_id):
 
         paths = _paths_for_row(row)
         supabase.table("marriage_records").delete().eq("id", record_id).execute()
-        invalidate_analytics_cache("marriage_records")  # analytics cache
-
-        leftover = [os.path.basename(p) for p in paths if not _safe_remove(p)]
-
-        record_action(
-            "RECORD_DELETED_PERMANENTLY",
-            f"Permanently deleted marriage record: '{row.get('file_name', record_id)}'",
-            username=get_user(),
-            meta={"record_id": record_id, "file_name": row.get("file_name"),
-                  "files_left_on_disk": leftover},
-            ip=request.remote_addr
-        )
-
-        payload = {"success": True, "message": "Record deleted successfully."}
-        if leftover:
-            payload["warning"] = "Record deleted, but some file(s) could not be removed from disk. " \
-                                 "Run /api/marriage/admin/cleanup-orphans to remove them."
-        return jsonify(payload), 200
     except Exception as e:
         return jsonify({"error": f"Failed to delete record: {e}"}), 500
+
+    # ── Step 2: everything below runs after the DB delete succeeded. ──
+    # None of it may change the response: the record is already gone.
+    leftover = []
+    try:
+        leftover = [os.path.basename(p) for p in paths if not _safe_remove(p)]
+    except Exception as e:
+        print(f"[MARRIAGE] file cleanup error for record {record_id}: {e}")
+
+    _safe_invalidate("marriage_records")
+
+    if leftover:
+        print(f"[MARRIAGE] record {record_id} deleted, but these files remain on disk: "
+              f"{leftover}. Run /api/marriage/admin/cleanup-orphans to remove them.")
+
+    _audit_vital(
+        "RECORD_DELETED_PERMANENTLY",
+        f"Permanently deleted marriage record: '{row.get('file_name', record_id)}'",
+        record_type="marriage_record", record_id=record_id,
+        file_name=row.get("file_name"),
+        meta={"files_left_on_disk": leftover},
+    )
+
+    return jsonify({"success": True, "message": "Record deleted successfully."}), 200
+
+
+@marriage_bp.route("/records/bulk-delete", methods=["POST"])
+def bulk_delete_marriage():
+    ids = _parse_bulk_ids(request.get_json(silent=True))
+    if ids is None:
+        return jsonify({"error": f"Send 1 to {MAX_BULK_DELETE} numeric ids."}), 400
+    try:
+        deleted_rows, failed_ids = _bulk_delete_rows("marriage_records", ids, select_cols="*")
+    except Exception as e:
+        return jsonify({"error": f"Failed to delete records: {e}"}), 500
+
+    leftover = []
+    for row in deleted_rows:
+        for path in _paths_for_row(row):
+            if not _safe_remove(path):
+                leftover.append(os.path.basename(path))
+
+    deleted_ids = [r["id"] for r in deleted_rows]
+    _safe_invalidate("marriage_records")
+    _audit_vital(
+        "RECORD_DELETED_PERMANENTLY",
+        f"Permanently deleted {len(deleted_ids)} marriage record(s) in bulk",
+        record_type="marriage_record",
+        meta={"record_ids": deleted_ids, "failed_count": len(failed_ids),
+              "files_left_on_disk": leftover},
+    )
+    return jsonify({"success": True, "deleted_ids": deleted_ids, "failed_ids": failed_ids}), 200
 
 
 # =============================================================================
 # SHARED UPLOAD LOGIC (Marriage)
 # =============================================================================
 
-def _upload_pdf(target="archive"):
+def _store_marriage_pdf(pdf_bytes, original_filename, section, form):
+    """Save one marriage PDF to the archive. Returns (response_dict, http_status)."""
     tmp_path = None
-    is_archived = True if target == "archive" else False
-    dest_dir    = ARCHIVE_UPLOAD_DIR if is_archived else UPLOAD_DIR
-
+    dest_dir = ARCHIVE_UPLOAD_DIR
     try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file uploaded."}), 400
-        file = request.files["file"]
-        if not file or file.filename == "":
-            return jsonify({"error": "No file selected."}), 400
-        if not marriage_allowed_file(file.filename):
-            return jsonify({"error": "Only PDF files are allowed."}), 400
-
-        file.seek(0, os.SEEK_END)
-        size = file.tell()
-        file.seek(0)
-        if size > MARRIAGE_MAX_FILE_SIZE_BYTES:
-            return jsonify({"error": f"File exceeds {MARRIAGE_MAX_FILE_SIZE_MB} MB limit."}), 400
-
-        file_hash          = compute_file_hash(file)
-        original_file_name = normalize_filename(file.filename)
+        file_hash          = compute_file_hash(io.BytesIO(pdf_bytes))
+        original_file_name = normalize_filename(original_filename)
         file_name          = os.path.splitext(original_file_name)[0]
         stored_file_name   = f"{uuid.uuid4().hex}_{original_file_name}"
         file_path          = os.path.join(dest_dir, stored_file_name)
 
-        dup_error = check_duplicate(original_file_name, file_hash)
+        dup_error = _retry_transient(lambda: check_duplicate(original_file_name, file_hash))
         if dup_error:
             _audit_vital("MARRIAGE_PDF_UPLOADED", "Upload rejected: duplicate file",
                          record_type="marriage_record", status="FAILED",
                          meta={"reason": "duplicate"})
-            return jsonify({"error": dup_error}), 409
+            return {"error": dup_error}, 409
 
         tmp_path = file_path
-        file.save(file_path)
+        with open(file_path, "wb") as fh:
+            fh.write(pdf_bytes)
         if not os.path.isfile(file_path):
-            return jsonify({"error": "File was not saved correctly."}), 500
+            return {"error": "File was not saved correctly."}, 500
 
         pdf_fields = extract_pdf_fields(file_path)
         mapped     = map_marriage_pdf_fields(pdf_fields)
@@ -2810,29 +2987,24 @@ def _upload_pdf(target="archive"):
             "file_path": file_path,
             "file_hash": file_hash,
             **mapped,
-            # Explicitly set (never left NULL) so records can't silently
-            # vanish from every tab.
-            "is_archived": is_archived,
+            "is_archived": True,
             "archived_at": now_iso,
             "uploaded_at": now_iso,
             "updated_at": now_iso,
         }
 
-        res = supabase.table("marriage_records").insert(insert_payload).execute()
+        res = _insert_once("marriage_records", insert_payload, "original_file_name")
         if not res.data:
-            return jsonify({"error": "Failed to insert record."}), 500
+            return {"error": "Failed to insert record."}, 500
 
         tmp_path = None
         new_row  = res.data[0]
         _audit_vital("MARRIAGE_PDF_UPLOADED",
-                     f"Uploaded marriage record PDF to {'archive' if is_archived else 'registry'}",
-                     record_type="marriage_record", record_id=new_row.get("id"), file_name=file_name)
-        invalidate_analytics_cache("marriage_records")  # analytics cache
-
-        # No notification on upload — notifications fire only when a
-        # matching record is found and a certificate is issued.
-
-        return jsonify(row_to_frontend(new_row)), 201
+                     "Uploaded marriage record PDF to archive",
+                     record_type="marriage_record", record_id=new_row.get("id"),
+                     file_name=file_name)
+        invalidate_analytics_cache("marriage_records")
+        return row_to_frontend(new_row), 201
 
     except APIError as e:
         msg = str(e)
@@ -2842,14 +3014,13 @@ def _upload_pdf(target="archive"):
             friendly = "This file's content already exists (database constraint)."
         else:
             friendly = f"Duplicate entry detected: {msg}"
-        return jsonify({"error": friendly}), 409
+        return {"error": friendly}, 409
 
     except Exception as e:
-        return jsonify({"error": f"Failed to process PDF: {e}"}), 500
+        return {"error": f"Failed to process PDF: {e}"}, 500
 
     finally:
-        # If anything failed after the file was written, remove it so a
-        # rejected upload never leaves a stray copy behind.
+        # Remove the written file if anything failed after it was saved.
         if tmp_path and os.path.exists(tmp_path):
             _safe_remove(tmp_path)
 
@@ -3195,6 +3366,95 @@ def get_payments():
         }), 200
     except Exception as e:
         return jsonify({"error": f"Failed to load marriage payments: {e}"}), 500
+
+
+# =============================================================================
+# UNIFIED PDF UPLOAD DISPATCHER (Birth / Marriage / Death)
+#
+# Every upload is classified from its contents and saved to the section that
+# matches the document, no matter which section it was uploaded from.
+# =============================================================================
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+_STORE_BY_TYPE = {
+    "birth":    _store_birth_pdf,
+    "marriage": _store_marriage_pdf,
+    "death":    _store_death_pdf,
+}
+_TYPE_LABEL = {"birth": "Birth", "marriage": "Marriage", "death": "Death"}
+
+
+def _display_name_for(record_type, body):
+    """Name shown in the upload results, based on the section the record was saved to."""
+    if record_type == "birth":
+        return body.get("child_full_name") or body.get("file_name")
+    if record_type == "marriage":
+        names = [body.get("groom_full_name"), body.get("bride_full_name")]
+        return " & ".join(n for n in names if n) or body.get("file_name")
+    return body.get("deceased_full_name") or body.get("file_name")
+
+
+def _mismatch_warning(detected, section, display_name):
+    return (f"{display_name} is a {_TYPE_LABEL[detected]} record, not "
+            f"{_TYPE_LABEL[section]}. It was saved to {_TYPE_LABEL[detected]} records.")
+
+
+def _dispatch_pdf_upload(section):
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded."}), 400
+    file = request.files["file"]
+    if not file or not file.filename:
+        return jsonify({"error": "No file selected."}), 400
+    if not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF files are allowed."}), 400
+
+    pdf_bytes = file.read()
+    if not pdf_bytes:
+        return jsonify({"error": "Uploaded file is empty."}), 400
+    if len(pdf_bytes) > MAX_UPLOAD_BYTES:
+        return jsonify({"error": "File exceeds the 20 MB limit."}), 400
+
+    detected, method = classify_record_pdf(pdf_bytes)
+    target = detected or section   # uncertain files stay in the section they were sent from
+
+    body, status = _STORE_BY_TYPE[target](pdf_bytes, file.filename.strip(), section, request.form)
+    if status >= 300 or not isinstance(body, dict):
+        return jsonify(body), status
+
+    routed = detected is not None and detected != section
+    needs_review = detected is None
+    record_id = body.get("id")
+    file_name = body.get("file_name") or body.get("original_file_name")
+    display_name = _display_name_for(target, body)
+
+    body.update({
+        "record_type": target,
+        "uploaded_from": section,
+        "routed": routed,
+        "needs_review": needs_review,
+        "classification": method,
+        "display_name": display_name,
+        "warning": _mismatch_warning(target, section, display_name) if routed else None,
+    })
+
+    if routed:
+        _audit_vital(
+            "RECORD_AUTO_ROUTED",
+            f"Uploaded from {_TYPE_LABEL[section]} section but identified as "
+            f"{_TYPE_LABEL[target]}; saved to {_TYPE_LABEL[target]}",
+            record_type=f"{target}_record", record_id=record_id, file_name=file_name,
+            meta={"uploaded_from": section, "classification": method},
+        )
+    elif needs_review:
+        _audit_vital(
+            "RECORD_CLASSIFICATION_UNCERTAIN",
+            f"Record type could not be confirmed; saved to {_TYPE_LABEL[section]} for review",
+            record_type=f"{section}_record", record_id=record_id, file_name=file_name,
+            meta={"classification": method},
+        )
+
+    return jsonify(body), status
 
 
 # =============================================================================
