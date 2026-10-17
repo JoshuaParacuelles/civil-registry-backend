@@ -34,6 +34,11 @@ TTL_AGG_HEAVY = 60         # computed aggregates (year/month/municipality/growth
 TTL_AGG_TODAY = 10         # computed "today" dashboard
 MAX_STALE_SECONDS = 600    # never serve cached data older than this on failure (item 4)
 
+# Archive definition — MUST match the Vital Records archive endpoints:
+#   archived  = is_archived is TRUE or NULL
+#   active    = is_archived is FALSE
+ARCHIVED_OR_FILTER = "is_archived.eq.true,is_archived.is.null"
+
 MONTH_NAMES = [
     "", "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -130,6 +135,10 @@ _CACHE_LOCKS = {}
 _CACHE_GUARD = threading.Lock()
 _CACHE_MAX_ENTRIES = 64
 
+# Bumped on every invalidation. A load that started before an invalidation
+# must NOT store its (possibly pre-delete) result afterwards.
+_CACHE_GEN = 0
+
 
 def cached(key, ttl, loader, max_stale=MAX_STALE_SECONDS):
     """
@@ -148,6 +157,7 @@ def cached(key, ttl, loader, max_stale=MAX_STALE_SECONDS):
         now = time.monotonic()
         with _CACHE_GUARD:
             hit = _CACHE.get(key)
+            gen_at_start = _CACHE_GEN
         if hit and now - hit[0] < ttl:
             return hit[1]
 
@@ -161,12 +171,14 @@ def cached(key, ttl, loader, max_stale=MAX_STALE_SECONDS):
             raise
 
         with _CACHE_GUARD:
-            _CACHE[key] = (time.monotonic(), value)
-            while len(_CACHE) > _CACHE_MAX_ENTRIES:
-                oldest_key = min(_CACHE, key=lambda k: _CACHE[k][0])
-                _CACHE.pop(oldest_key, None)
-                if oldest_key != key:
-                    _CACHE_LOCKS.pop(oldest_key, None)
+            # Only store if nothing was invalidated while we were loading.
+            if gen_at_start == _CACHE_GEN:
+                _CACHE[key] = (time.monotonic(), value)
+                while len(_CACHE) > _CACHE_MAX_ENTRIES:
+                    oldest_key = min(_CACHE, key=lambda k: _CACHE[k][0])
+                    _CACHE.pop(oldest_key, None)
+                    if oldest_key != key:
+                        _CACHE_LOCKS.pop(oldest_key, None)
         return value
 
 
@@ -177,7 +189,9 @@ def invalidate_analytics_cache(record_table=None):
     - record_table given: clears that table's raw/count caches plus all
       aggregates (aggregates depend on every table).
     """
+    global _CACHE_GEN
     with _CACHE_GUARD:
+        _CACHE_GEN += 1
         for key in list(_CACHE):
             if (
                 record_table is None
@@ -352,7 +366,7 @@ def _to_amount(val):
 
 
 def _to_bool_or_none(val):
-    """Normalizes is_archived (bool / None / 'true'/'f' / 1/0). Used by /debug-counts."""
+    """Normalizes is_archived (bool / None / 'true'/'f' / 1/0)."""
     if val is None:
         return None
     if isinstance(val, bool):
@@ -525,7 +539,7 @@ def _fetch_recent_record_rows(table_name):
 
 
 def _count_exact(table_name):
-    """Total row count WITHOUT downloading the rows (item 3)."""
+    """Total row count (archived + active) WITHOUT downloading the rows."""
     def load():
         try:
             res = _execute_with_retry(
@@ -545,16 +559,52 @@ def _count_exact(table_name):
     return cached(("count", table_name), TTL_COUNT, load)
 
 
-def table_counts(table_name):
-    """Returns (total_count, today_count) without downloading whole tables."""
-    total = _count_exact(table_name)
+def _count_by_archive(table_name, archived):
+    """
+    Exact count of ARCHIVED (is_archived TRUE or NULL) or ACTIVE
+    (is_archived FALSE) rows. Uses the same definition as the Vital Records
+    archive endpoints, so the dashboard and the Archive tab always agree.
+    """
+    key_name = "count-archived" if archived else "count-active"
+
+    def load():
+        def build():
+            q = supabase.table(table_name).select("id", count="exact")
+            if archived:
+                q = q.or_(ARCHIVED_OR_FILTER)
+            else:
+                q = q.eq(ARCHIVED_COL, "false")
+            return q.limit(1)
+
+        try:
+            res = _execute_with_retry(build, f"{table_name} {key_name}")
+            if res.count is not None:
+                return int(res.count)
+        except Exception as e:
+            print(f"[Analytics] {key_name} count failed for {table_name}, "
+                  f"falling back to full fetch: {e}")
+
+        rows = fetch_all_rows(table_name)
+        total = 0
+        for r in rows:
+            flag = _to_bool_or_none(r.get(ARCHIVED_COL))
+            is_archived_row = flag is not False  # True or unrecognised/NULL
+            if is_archived_row == archived:
+                total += 1
+        return total
+
+    return cached((key_name, table_name), TTL_COUNT, load)
+
+
+def _uploaded_today_count(table_name):
+    """Number of rows uploaded inside the current business-day window."""
     start, end = _business_day_window()
     today = 0
     for r in _fetch_recent_record_rows(table_name):
         dt = _parse_uploaded_at(r.get(UPLOAD_COL), NAIVE_UPLOADED_AT_IS_UTC)
         if dt and start <= dt < end:
             today += 1
-    return total, today
+    return today
 
 
 def payment_stats_today(record_table_name):
@@ -586,23 +636,41 @@ def payment_stats_today(record_table_name):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _compute_summary():
-    birth_total, b_today = table_counts("birth_records")
-    marriage_total, m_today = table_counts("marriage_records")
-    death_total, d_today = table_counts("death_records")
+    totals = {tbl: _count_exact(tbl) for tbl in RECORD_TABLES}
+    active = {tbl: _count_by_archive(tbl, archived=False) for tbl in RECORD_TABLES}
+    archived = {tbl: _count_by_archive(tbl, archived=True) for tbl in RECORD_TABLES}
+    today = {tbl: _uploaded_today_count(tbl) for tbl in RECORD_TABLES}
 
+    birth_total = totals["birth_records"]
+    marriage_total = totals["marriage_records"]
+    death_total = totals["death_records"]
     total_all = birth_total + marriage_total + death_total
+
+    active_all = sum(active.values())
+    archived_all = sum(archived.values())
+
     return {
         "total_records": total_all,
-        "active_records": total_all,
-        "archived_records": 0,
+        "active_records": active_all,
+        "archived_records": archived_all,
         "total_birth_records": birth_total,
         "total_marriage_records": marriage_total,
         "total_death_records": death_total,
-        "uploaded_today": b_today + m_today + d_today,
+        "active_by_type": {
+            "birth": active["birth_records"],
+            "marriage": active["marriage_records"],
+            "death": active["death_records"],
+        },
+        "archived_by_type": {
+            "birth": archived["birth_records"],
+            "marriage": archived["marriage_records"],
+            "death": archived["death_records"],
+        },
+        "uploaded_today": sum(today.values()),
         "uploaded_today_breakdown": {
-            "birth": b_today,
-            "marriage": m_today,
-            "death": d_today,
+            "birth": today["birth_records"],
+            "marriage": today["marriage_records"],
+            "death": today["death_records"],
         },
         "record_breakdown": [
             {"label": "Birth", "count": birth_total},
@@ -874,7 +942,8 @@ def debug_counts():
                 "is_archived_true": archived_true,
                 "is_archived_false": archived_false,
                 "is_archived_null_or_unrecognized": archived_null,
-                "would_count_as_active": archived_false + archived_null,
+                "shown_in_archive_tab": archived_true + archived_null,
+                "shown_as_active_in_registry": archived_false,
                 "sample_row": rows[0] if rows else None,
                 "fetch_returned_zero_rows": len(rows) == 0,
                 "fetch_error": fetch_error,
