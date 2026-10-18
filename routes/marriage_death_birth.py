@@ -558,8 +558,6 @@ def get_records():
     except Exception as e:
         print(f"[DEATH] DB unavailable, serving local cache: {e}", flush=True)
         return _respond(load_local()["death_active"], offline=True)
->>>>>>> a364136 (gitgitaw)
-
 
 # Rows inserted directly via the Supabase table editor can have is_archived
 # NULL, which a plain .eq() never matches. Death uploads always set
