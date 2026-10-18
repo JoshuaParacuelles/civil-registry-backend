@@ -131,7 +131,7 @@ CORS(app,
      allow_headers=['Content-Type', 'Authorization', 'X-Requested-With', 'Cache-Control', 'Pragma',
                     'X-Offline-Op-Id', 'X-Offline-Created-At'],
      methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-     expose_headers=['Content-Type', 'Set-Cookie'],
+     expose_headers=['Content-Type', 'Set-Cookie', 'X-Data-Source', 'X-Document-Api'],
      max_age=86400
 )
 

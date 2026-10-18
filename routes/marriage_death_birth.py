@@ -20,6 +20,28 @@ from routes.notification import push_notification
 from routes.analytics import invalidate_analytics_cache  # analytics cache
 from logs.Audits import record_action, client_ip
 from security import login_required_hook, admin_required, entity_permission_hook
+from auth.local_data import load as load_local, save_section, save_key
+
+
+# =============================================================================
+# SHARED OFFLINE-CACHE HELPERS
+# =============================================================================
+
+def _respond(rows, offline=False):
+    """JSON response. Adds X-Data-Source when the rows came from the local cache."""
+    resp = jsonify(rows)
+    if offline:
+        resp.headers["X-Data-Source"] = "offline-cache"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _local_contains(rows, text, fields):
+    """Offline version of the Supabase ilike search: any field contains text."""
+    if not text:
+        return rows
+    t = text.lower()
+    return [r for r in rows if any(t in str(r.get(f) or "").lower() for f in fields)]
 
 
 # =============================================================================
@@ -524,12 +546,19 @@ def parse_death_certificate_from_bytes(pdf_bytes: bytes) -> Dict:
 
 @death_bp.route("/records", methods=["GET"])
 def get_records():
-    # Strict "false" so archived rows (TRUE or NULL) appear only under
+    # Strict false so archived rows (TRUE or NULL) appear only under
     # /archived, matching the Birth and Marriage active lists.
-    res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS) \
-        .eq("is_archived", "false") \
-        .order("uploaded_at", desc=True).order("id", desc=True).execute()
-    return jsonify(res.data)
+    try:
+        res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS) \
+            .eq("is_archived", _bool_filter(False)) \
+            .order("uploaded_at", desc=True).order("id", desc=True).execute()
+        rows = res.data or []
+        save_section("death_active", rows)
+        return _respond(rows)
+    except Exception as e:
+        print(f"[DEATH] DB unavailable, serving local cache: {e}", flush=True)
+        return _respond(load_local()["death_active"], offline=True)
+>>>>>>> a364136 (gitgitaw)
 
 
 # Rows inserted directly via the Supabase table editor can have is_archived
@@ -544,11 +573,12 @@ def get_archived_records():
         res = supabase.table("death_records").select(DEATH_RECORD_SELECT_COLS) \
             .or_(DEATH_ARCHIVED_FILTER) \
             .order("archived_at", desc=True).order("id", desc=True).execute()
-        return jsonify(res.data)
+        rows = res.data or []
+        save_section("death_archived", rows)
+        return _respond(rows)
     except Exception as e:
-        import traceback
-        traceback.print_exc()  # real PostgREST error goes to server logs
-        return jsonify({"error": f"Failed to load archived records: {e}"}), 500
+        print(f"[DEATH] DB unavailable, serving archived cache: {e}", flush=True)
+        return _respond(load_local()["death_archived"], offline=True)
 
 
 @death_bp.route("/records", methods=["POST"])
@@ -1242,12 +1272,13 @@ LIST_FIELDS = (
 
 ARCHIVED_FIELDS = LIST_FIELDS.replace("updated_at", "archived_at")
 
+BIRTH_SEARCH_FIELDS = ("file_name", "child_full_name", "father_full_name", "mother_full_name")
+
 
 @birth_bp.route('/api/birth/records', methods=['GET'])
 def get_records():
+    search = request.args.get('search', '').strip()
     try:
-        search = request.args.get('search', '').strip()
-
         q = supabase.table("birth_records").select(LIST_FIELDS)
         if search:
             like = f"%{search}%"
@@ -1259,11 +1290,16 @@ def get_records():
         # Archive tab (see BIRTH_ARCHIVED_FILTER).
         q = q.eq("is_archived", _bool_filter(False))
         rows = q.order("uploaded_at", desc=True).execute().data or []
+        rows = [_serialize_record_no_pdf(r) for r in rows]
 
-        return jsonify([_serialize_record_no_pdf(r) for r in rows])
+        if not search:                      # cache the full list only
+            save_section("birth_active", rows)
+        return _respond(rows)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[BIRTH] DB unavailable, serving local cache: {e}", flush=True)
+        rows = _local_contains(load_local()["birth_active"], search, BIRTH_SEARCH_FIELDS)
+        return _respond(rows, offline=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1272,9 +1308,8 @@ def get_records():
 
 @birth_bp.route('/api/birth/archived', methods=['GET'])
 def get_archived_records():
+    search = request.args.get('search', '').strip()
     try:
-        search = request.args.get('search', '').strip()
-
         q = supabase.table("birth_records").select(ARCHIVED_FIELDS)
         if search:
             like = f"%{search}%"
@@ -1285,11 +1320,16 @@ def get_archived_records():
         # is_archived = TRUE or NULL (see BIRTH_ARCHIVED_FILTER).
         q = q.or_(BIRTH_ARCHIVED_FILTER)
         rows = q.order("archived_at", desc=True).execute().data or []
+        rows = [_serialize_record_no_pdf(r) for r in rows]
 
-        return jsonify([_serialize_record_no_pdf(r) for r in rows])
+        if not search:
+            save_section("birth_archived", rows)
+        return _respond(rows)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"[BIRTH] DB unavailable, serving archived cache: {e}", flush=True)
+        rows = _local_contains(load_local()["birth_archived"], search, BIRTH_SEARCH_FIELDS)
+        return _respond(rows, offline=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2733,19 +2773,41 @@ def admin_set_archived():
 # ACTIVE RECORDS (Marriage)
 # =============================================================================
 
+MARRIAGE_SEARCH_FIELDS = (
+    "file_name", "original_file_name", "groom_full_name", "bride_full_name",
+    "groom_first_name", "groom_last_name", "bride_first_name", "bride_last_name",
+    "registry_no", "city_municipality", "province",
+)
+
+
+def _marriage_local_filter(rows, search, fname, lname):
+    """Same AND logic as the Supabase .or_() chains in get_archived_records."""
+    rows = _local_contains(rows, search, MARRIAGE_SEARCH_FIELDS)
+    if fname:
+        f = fname.lower()
+        rows = [r for r in rows
+                if f in (r.get("groom_first_name") or "").lower()
+                or f in (r.get("bride_first_name") or "").lower()]
+    if lname:
+        l = lname.lower()
+        rows = [r for r in rows
+                if l in (r.get("groom_last_name") or "").lower()
+                or l in (r.get("bride_last_name") or "").lower()]
+    return rows
+
+
 @marriage_bp.route("/records", methods=["GET"])
 def get_records():
     try:
-        # Strict eq(false) so a record can never appear in both the Active
-        # search and the Archive tab (NULL rows belong to the archive filter).
         res = supabase.table("marriage_records").select(MARRIAGE_RECORD_SELECT_COLS) \
             .eq("is_archived", _bool_filter(False)) \
             .order("uploaded_at", desc=True).order("id", desc=True).execute()
-        return jsonify([row_to_frontend(r) for r in res.data]), 200
+        rows = [row_to_frontend(r) for r in (res.data or [])]
+        save_section("marriage_active", rows)
+        return _respond(rows)
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Failed to load records: {e}"}), 500
+        print(f"[MARRIAGE] DB unavailable, serving local cache: {e}", flush=True)
+        return _respond(load_local()["marriage_active"], offline=True)
 
 
 # =============================================================================
@@ -2760,12 +2822,10 @@ def _or_escape(v: str) -> str:
 
 @marriage_bp.route("/archived", methods=["GET"])
 def get_archived_records():
+    search = request.args.get("search",     "").strip()
+    fname  = request.args.get("first_name", "").strip()
+    lname  = request.args.get("last_name",  "").strip()
     try:
-        search = request.args.get("search",     "").strip()
-        fname  = request.args.get("first_name", "").strip()
-        lname  = request.args.get("last_name",  "").strip()
-
-        # is_archived = TRUE or NULL (see MARRIAGE_ARCHIVED_FILTER).
         query = supabase.table("marriage_records").select(MARRIAGE_RECORD_SELECT_COLS) \
             .or_(MARRIAGE_ARCHIVED_FILTER)
 
@@ -2775,21 +2835,24 @@ def get_archived_records():
                     "groom_first_name", "groom_last_name", "bride_first_name", "bride_last_name",
                     "registry_no", "city_municipality", "province"]
             query = query.or_(",".join(f"{c}.ilike.%{s}%" for c in cols))
-
         if fname:
             f = _or_escape(fname)
             query = query.or_(f"groom_first_name.ilike.%{f}%,bride_first_name.ilike.%{f}%")
-
         if lname:
             l = _or_escape(lname)
             query = query.or_(f"groom_last_name.ilike.%{l}%,bride_last_name.ilike.%{l}%")
 
         res = query.order("archived_at", desc=True).order("id", desc=True).execute()
-        return jsonify([row_to_frontend(r) for r in res.data]), 200
+        rows = [row_to_frontend(r) for r in (res.data or [])]
+
+        if not (search or fname or lname):   # cache the unfiltered list only
+            save_section("marriage_archived", rows)
+        return _respond(rows)
+
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Failed to load archived records: {e}"}), 500
+        print(f"[MARRIAGE] DB unavailable, serving archived cache: {e}", flush=True)
+        rows = _marriage_local_filter(load_local()["marriage_archived"], search, fname, lname)
+        return _respond(rows, offline=True)
 
 
 # =============================================================================

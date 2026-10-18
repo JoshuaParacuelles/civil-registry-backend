@@ -8,6 +8,7 @@ from flask import Blueprint, g, jsonify, request, session
 from werkzeug.exceptions import HTTPException
 
 from auth.Rolemanagement import get_user_permissions, is_admin
+from auth.local_data import load as load_local, save_key
 from logs.Audits import mask_identifier, record_action, record_document_event
 from security import audit_denial, entity_permission_hook
 from supabase_client import supabase
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Bump this when the response shape changes. Shown in the X-Document-Api
 # response header so you can confirm which code is running.
-DOCUMENT_API_VERSION = "handled-v3"
+DOCUMENT_API_VERSION = "handled-v4-offline"
 
 
 @document_bp.errorhandler(Exception)
@@ -122,6 +123,41 @@ STATUS_LABELS = {
     "changes_requested": "Changes requested",
     "rejected": "Rejected",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Response + offline cache helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+def _respond(rows, offline=False):
+    """JSON response. Adds X-Data-Source when the rows came from the local cache."""
+    resp = jsonify(rows)
+    if offline:
+        resp.headers["X-Data-Source"] = "offline-cache"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _doc_cache_key(username, archived):
+    return f"{(username or '').lower()}:{'archived' if archived else 'active'}"
+
+
+def _offline_documents(username, archived):
+    cached = load_local().get("documents") or {}
+    rows = cached.get(_doc_cache_key(username, archived)) if isinstance(cached, dict) else None
+    if rows is None:
+        return jsonify({
+            "error": "Document Tracking is not available offline yet. Open it once while online first."
+        }), 503
+    return _respond(rows, offline=True)
+
+
+def _save_documents_cache(username, archived, documents):
+    """Never lets a cache write failure break the live response."""
+    try:
+        save_key("documents", _doc_cache_key(username, archived), documents)
+    except Exception as e:
+        logger.exception("Could not save document list to local cache: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -731,6 +767,9 @@ def list_documents():
     Administrators see every active (or archived) document. Other users see
     documents whose ACTIVE step they hold, plus documents they have completed
     a step on, so their own work stays visible after the step moves on.
+
+    Offline: when the database is unreachable, the last list saved for this
+    user and tab (active or archived) is served from local_data.json.
     """
     err = require_login()
     if err:
@@ -742,9 +781,7 @@ def list_documents():
 
     # Only administrators can see the archive.
     if want_archived and not admin:
-        response = jsonify([])
-        response.headers["X-Document-Api"] = DOCUMENT_API_VERSION
-        return response
+        return _respond([])
 
     try:
         res = execute_with_retry(
@@ -753,10 +790,12 @@ def list_documents():
         rows = res.data
     except Exception as e:
         logger.exception("Failed to query documents")
-        return jsonify({"error": f"Database error while loading documents: {e}"}), 500
+        print(f"[DOCUMENTS] DB unavailable, serving local cache: {e}", flush=True)
+        return _offline_documents(username, want_archived)
 
     if rows is None:
-        return jsonify({"error": "Could not load documents from the database"}), 500
+        print("[DOCUMENTS] Empty response from DB, serving local cache", flush=True)
+        return _offline_documents(username, want_archived)
 
     # Split active vs. archived on archived_at so each list is always correct.
     rows = [r for r in rows if bool(r.get("archived_at")) == want_archived]
@@ -802,10 +841,16 @@ def list_documents():
         )
     except Exception as e:
         logger.exception("Failed to shape document rows")
-        return jsonify({"error": f"Server error while processing documents: {e}"}), 500
+        print(f"[DOCUMENTS] Shaping failed, serving local cache: {e}", flush=True)
+        return _offline_documents(username, want_archived)
+
+    # Save the live result for offline use. Done before responding so the
+    # cache always holds the list the user just saw.
+    _save_documents_cache(username, want_archived, documents)
 
     response = jsonify(documents)
     response.headers["X-Document-Api"] = DOCUMENT_API_VERSION
+    response.headers["Cache-Control"] = "no-store"
     return response
 
 
