@@ -11,6 +11,7 @@ Add local_users.json to .gitignore.
 import json
 import os
 import getpass
+import tempfile
 from datetime import datetime, timezone
 from werkzeug.security import generate_password_hash
 
@@ -19,8 +20,42 @@ FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_users.jso
 try:
     with open(FILE, "r", encoding="utf-8") as f:
         users = json.load(f)
-except Exception:
+except FileNotFoundError:
     users = {}
+except Exception as e:
+    raise SystemExit(
+        f"Refusing to overwrite {FILE}: it can't be read ({e}). "
+        "Fix or move the file, then run this again."
+    )
+
+if not isinstance(users, dict):
+    raise SystemExit(
+        f"Refusing to overwrite {FILE}: expected a JSON object at the top level."
+    )
+
+
+def save(data):
+    """Write atomically so an interrupted run can't leave a truncated file."""
+    folder = os.path.dirname(FILE)
+    fd, tmp_path = tempfile.mkstemp(dir=folder, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, FILE)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def ask_user_id():
+    """Keeps asking until the user enters a positive whole number."""
+    while True:
+        raw = input("User ID from Supabase users table (required): ").strip()
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        print("A numeric user ID is required (for example, 12).\n")
+
 
 while True:
     username = input("Username (blank to finish): ").strip()
@@ -32,8 +67,7 @@ while True:
         print("Password required.\n")
         continue
 
-    raw_id = input("User ID from Supabase users table (Enter for 1): ").strip()
-    user_id = int(raw_id) if raw_id.isdigit() else (raw_id or 1)
+    user_id = ask_user_id()
 
     is_admin = input("Is admin? (y/N): ").strip().lower() == "y"
     permissions = ["dashboard"]
@@ -50,9 +84,7 @@ while True:
         "fail_count": 0,
         "locked_until": None,
     }
+    save(users)
     print(f"Saved '{username}'.\n")
-
-with open(FILE, "w", encoding="utf-8") as f:
-    json.dump(users, f, indent=2)
 
 print(f"Done. Wrote {len(users)} user(s) to {FILE}")

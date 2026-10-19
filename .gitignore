@@ -33,3 +33,8 @@ fix_password.py
 Thumbs.db
 .vscode/
 .idea/
+# ---------- Local credentials and databases ----------
+local_users.json
+local_data.json
+*.db
+*.sqlite3

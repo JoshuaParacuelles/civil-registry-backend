@@ -97,9 +97,9 @@ def _verify_sha256_hex(plain: str, hashed) -> bool:
 
 def _verify_password(plain: str, stored) -> bool:
     """
-    Tries every hash format this codebase has ever used, in order:
-    werkzeug (scrypt/pbkdf2 — what Rolemanagement.py actually writes),
-    bcrypt, sha256-hex, then a last-resort plaintext-equality check.
+    Tries every supported hash format in order: werkzeug (scrypt/pbkdf2 —
+    what Rolemanagement.py actually writes), bcrypt, then sha256-hex.
+    Stored plaintext is never accepted.
     """
     stored_str = stored.decode("utf-8") if isinstance(stored, (bytes, bytearray)) else str(stored)
     print(
@@ -117,9 +117,6 @@ def _verify_password(plain: str, stored) -> bool:
         return True
     if _verify_sha256_hex(plain, stored):
         print("[_verify_password] matched via sha256")
-        return True
-    if plain and stored is not None and plain == str(stored):
-        print("[_verify_password] matched via plaintext fallback")
         return True
 
     print("[_verify_password] no match against any known hash format")

@@ -5,18 +5,18 @@ from flask import Blueprint, jsonify, session
 from supabase_client import supabase
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-from auth.Rolemanagement import is_admin
-from security import audit_denial
+from security import login_required_hook
 
 analytics_bp = Blueprint("analytics", __name__)
+
+# Every analytics route requires a logged-in session. Runs before any route
+# and before any cached value is returned, so caching cannot leak data to
+# unauthenticated callers.
+analytics_bp.before_request(login_required_hook)
 
 # ══════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════
-
-# Require a logged-in session for every analytics route (item 6).
-# /debug-counts additionally requires admin.
-REQUIRE_LOGIN = True
 
 # Set True ONLY if records' `uploaded_at` is a `timestamp WITHOUT time zone`
 # column filled by a UTC default (e.g. now() on a server running in UTC).
@@ -33,6 +33,11 @@ TTL_COUNT = 30             # exact counts
 TTL_AGG_HEAVY = 60         # computed aggregates (year/month/municipality/growth)
 TTL_AGG_TODAY = 10         # computed "today" dashboard
 MAX_STALE_SECONDS = 600    # never serve cached data older than this on failure (item 4)
+
+# Per-user rate limit for /refresh. Every dashboard user triggers it, so it is
+# limited per user rather than restricted to admins. Counted per worker process.
+REFRESH_WINDOW_SECONDS = 60
+REFRESH_MAX_PER_WINDOW = 6
 
 # Archive definition — MUST match the Vital Records archive endpoints:
 #   archived  = is_archived is TRUE or NULL
@@ -105,22 +110,6 @@ PAYMENT_TABLES = {
         "date_col": "created_at",
     },
 }
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# AUTH (item 6)
-# ══════════════════════════════════════════════════════════════════════════
-
-@analytics_bp.before_request
-def _require_login():
-    # Runs BEFORE any route (and before any cached value is returned), so
-    # caching can never leak data to unauthenticated callers.
-    if not REQUIRE_LOGIN:
-        return None
-    if not session.get("username"):
-        audit_denial("Analytics route requires authentication")
-        return jsonify({"error": "Not logged in"}), 401
-    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -387,7 +376,6 @@ def _to_bool_or_none(val):
 #
 # Fetch failures RAISE (instead of returning a misleading 0). Every route
 # wraps its body in try/except and returns {"error": ...}, 500.
-# /debug-counts uses _fetch_paginated_safe so it can report broken tables.
 # ══════════════════════════════════════════════════════════════════════════
 
 # Transient socket hiccups worth a quick retry (e.g. WinError 10035 on Windows
@@ -470,14 +458,6 @@ def _fetch_paginated(table_name, preferred_columns, gte=None, order_col="id"):
             f"Could not read table '{table_name}' from Supabase "
             f"(check credentials/RLS policies/network/column names): {e}"
         ) from e
-
-
-def _fetch_paginated_safe(table_name, preferred_columns):
-    """Never raises -- returns (rows, error_str). Used only by /debug-counts."""
-    try:
-        return _fetch_paginated(table_name, preferred_columns), None
-    except Exception as e:
-        return [], str(e)
 
 
 def fetch_all_rows(table_name):
@@ -915,51 +895,43 @@ def document_types():
     return _cached_route("document-types", TTL_COUNT, _compute_document_types, "document-types")
 
 
-@analytics_bp.route("/api/analytics/debug-counts", methods=["GET"])
-def debug_counts():
-    """
-    Diagnostic endpoint (admin only, never cached): raw total / active /
-    archived counts per table straight from Supabase. Never 500s on a broken
-    table -- check the per-table "fetch_error" field instead.
-    """
-    username = session.get("username")
-    if not username:
-        audit_denial("Debug analytics requires authentication")
-        return jsonify({"error": "Not logged in"}), 401
-    if not is_admin(username):
-        audit_denial("Debug analytics requires administrator access")
-        return jsonify({"error": "Forbidden"}), 403
+# ─────────────────────────────────────────────────────────────────────────
+# /refresh rate limit (per user, per worker process)
+# ─────────────────────────────────────────────────────────────────────────
 
-    try:
-        result = {}
-        for tbl in RECORD_TABLES:
-            rows, fetch_error = _fetch_paginated_safe(tbl, SELECT_COLUMNS[tbl])
-            archived_true = sum(1 for r in rows if _to_bool_or_none(r.get(ARCHIVED_COL)) is True)
-            archived_false = sum(1 for r in rows if _to_bool_or_none(r.get(ARCHIVED_COL)) is False)
-            archived_null = sum(1 for r in rows if _to_bool_or_none(r.get(ARCHIVED_COL)) is None)
-            result[tbl] = {
-                "total_rows_in_table": len(rows),
-                "is_archived_true": archived_true,
-                "is_archived_false": archived_false,
-                "is_archived_null_or_unrecognized": archived_null,
-                "shown_in_archive_tab": archived_true + archived_null,
-                "shown_as_active_in_registry": archived_false,
-                "sample_row": rows[0] if rows else None,
-                "fetch_returned_zero_rows": len(rows) == 0,
-                "fetch_error": fetch_error,
-            }
-        return jsonify(result), 200
-    except Exception as e:
-        print(f"[Analytics] /debug-counts error: {e}")
-        return jsonify({"error": str(e)}), 500
+_refresh_hits = defaultdict(list)
+_refresh_guard = threading.Lock()
+
+
+def _refresh_rate_limited(username):
+    """True when this user has already used up their /refresh quota for the window."""
+    now = time.monotonic()
+    key = (username or "").lower()
+    with _refresh_guard:
+        recent = [t for t in _refresh_hits[key] if now - t < REFRESH_WINDOW_SECONDS]
+        if len(recent) >= REFRESH_MAX_PER_WINDOW:
+            _refresh_hits[key] = recent
+            return True
+        recent.append(now)
+        _refresh_hits[key] = recent
+        return False
 
 
 @analytics_bp.route("/api/analytics/refresh", methods=["POST"])
 def refresh_cache():
     """
     Clears the worker-local analytics cache so the next dashboard fetch
-    reads fresh data. Protected by _require_login (before_request).
+    reads fresh data. Login is enforced by the blueprint-wide guard, and each
+    user is rate limited so one user cannot hammer the database.
     """
+    if _refresh_rate_limited(session.get("username")):
+        resp = jsonify({
+            "ok": False,
+            "error": "Too many refreshes. Please wait a minute and try again.",
+        })
+        resp.headers["Retry-After"] = str(REFRESH_WINDOW_SECONDS)
+        return resp, 429
+
     try:
         invalidate_analytics_cache()
         return jsonify({"ok": True}), 200
