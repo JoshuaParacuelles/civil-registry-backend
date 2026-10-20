@@ -35,7 +35,7 @@ from auth.Death_password import death_archive_bp, init_death_archive_db
 from auth.marriage_password import marriage_auth_bp, init_marriage_archive_db
 from logs.Audits import audit_bp, init_audit_db, record_action, mark_denial_logged
 from auth.Rolemanagement import role_bp, init_roles_db
-
+from routes.profile_routes import profile_bp
 app = Flask(__name__)
 
 # Compress JSON/HTML/CSS/JS responses. PDFs are not in the default mimetype
@@ -160,6 +160,7 @@ app.register_blueprint(notifications_bp)
 app.register_blueprint(external_bp)
 app.register_blueprint(document_bp)
 app.register_blueprint(citizen_requests_bp)
+app.register_blueprint(profile_bp)
 
 with app.app_context():
     try:
