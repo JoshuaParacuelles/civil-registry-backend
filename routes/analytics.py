@@ -22,7 +22,7 @@ analytics_bp.before_request(login_required_hook)
 # column filled by a UTC default (e.g. now() on a server running in UTC).
 # In that case naive values are UTC and must be shifted to Manila time.
 # If uploaded_at is timestamptz (has +00:00 in the API output) or is written
-# by the app with datetime.now() (local), leave this False. (item 5)
+# by the app with datetime.now() (local), leave this False.
 NAIVE_UPLOADED_AT_IS_UTC = False
 
 # Cache TTLs (seconds)
@@ -32,7 +32,7 @@ TTL_RECENT = 10            # "today" slices (kept short on purpose)
 TTL_COUNT = 30             # exact counts
 TTL_AGG_HEAVY = 60         # computed aggregates (year/month/municipality/growth)
 TTL_AGG_TODAY = 10         # computed "today" dashboard
-MAX_STALE_SECONDS = 600    # never serve cached data older than this on failure (item 4)
+MAX_STALE_SECONDS = 600    # never serve cached data older than this on failure
 
 # Per-user rate limit for /refresh. Every dashboard user triggers it, so it is
 # limited per user rather than restricted to admins. Counted per worker process.
@@ -116,8 +116,8 @@ PAYMENT_TABLES = {
 # CACHE
 # ══════════════════════════════════════════════════════════════════════════
 #
-# The cache is PER WORKER PROCESS. With several gunicorn workers,
-# each worker relies on the short TTLs. Use Redis if strict consistency is needed.
+# The cache is PER WORKER PROCESS. With several gunicorn workers, each worker
+# relies on the short TTLs. Use Redis if strict consistency is needed.
 
 _CACHE = {}
 _CACHE_LOCKS = {}
@@ -176,7 +176,7 @@ def invalidate_analytics_cache(record_table=None):
     Drop cached analytics data.
     - No argument: clears everything (used by the /refresh endpoint).
     - record_table given: clears that table's raw/count caches plus all
-      aggregates (aggregates depend on every table).
+      aggregates and monthly history (both depend on every table).
     """
     global _CACHE_GEN
     with _CACHE_GUARD:
@@ -184,7 +184,7 @@ def invalidate_analytics_cache(record_table=None):
         for key in list(_CACHE):
             if (
                 record_table is None
-                or key[0] == "agg"
+                or key[0] in ("agg", "history")
                 or (len(key) > 1 and key[1] == record_table)
             ):
                 _CACHE.pop(key, None)
@@ -310,8 +310,7 @@ def _resolve_upload_ym(row):
 def _resolve_transaction_ym(record_table_name, row):
     """
     (year, month) an actual certificate REQUEST happened, from that type's
-    payment/transaction table date column, in local time (so a request made
-    at 6 AM Manila on the 1st isn't bucketed into the previous UTC month).
+    payment/transaction table date column, in local time.
     """
     cfg = PAYMENT_TABLES[record_table_name]
     return _local_ym(row.get(cfg["date_col"]))
@@ -425,17 +424,16 @@ def _fetch_paginated(table_name, preferred_columns, gte=None, order_col="id"):
 
     Uses `preferred_columns` only. A select('*') fallback is deliberately NOT
     used: record tables hold base64 PDF blobs, so a wildcard select would pull
-    the entire archive into memory. Transient socket errors are retried per
-    page. Raises RuntimeError if the fetch fails so the real cause is reported.
+    the entire archive into memory. Raises RuntimeError if the fetch fails so
+    the real cause is reported.
     """
     batch_size = 1000
-    cols = preferred_columns
     all_rows = []
     offset = 0
     try:
         while True:
             def build(offset=offset):
-                query = supabase.table(table_name).select(cols)
+                query = supabase.table(table_name).select(preferred_columns)
                 if gte:
                     query = query.gte(*gte)
                 if order_col:
@@ -453,7 +451,7 @@ def _fetch_paginated(table_name, preferred_columns, gte=None, order_col="id"):
         return all_rows
     except Exception as e:
         print(f"[Analytics] ERROR: could not fetch rows for {table_name} "
-              f"with select('{cols}'): {e}")
+              f"with select('{preferred_columns}'): {e}")
         raise RuntimeError(
             f"Could not read table '{table_name}' from Supabase "
             f"(check credentials/RLS policies/network/column names): {e}"
@@ -467,11 +465,6 @@ def fetch_all_rows(table_name):
         TTL_RECORDS,
         lambda: _fetch_paginated(table_name, SELECT_COLUMNS[table_name]),
     )
-
-
-def active_rows(table_name):
-    """Return all rows; archive state does not exclude analytics records."""
-    return fetch_all_rows(table_name)
 
 
 def fetch_payment_rows(record_table_name):
@@ -518,6 +511,25 @@ def _fetch_recent_record_rows(table_name):
     )
 
 
+def _fetch_monthly_history(dataset):
+    """
+    Persistent monthly counts from the `monthly_history` table. The table is
+    filled by INSERT triggers and never decremented, so deleting or updating
+    live rows does not change past months.
+    """
+    def load():
+        res = _execute_with_retry(
+            lambda: supabase.table("monthly_history")
+            .select("record_type, year, month, count")
+            .eq("dataset", dataset)
+            .limit(10000),
+            f"monthly_history:{dataset}",
+        )
+        return res.data or []
+
+    return cached(("history", dataset), TTL_AGG_HEAVY, load)
+
+
 def _count_exact(table_name):
     """Total row count (archived + active) WITHOUT downloading the rows."""
     def load():
@@ -533,7 +545,6 @@ def _count_exact(table_name):
         except Exception as e:
             print(f"[Analytics] exact count failed for {table_name}, "
                   f"falling back to full fetch: {e}")
-        # Fallback keeps the old (correct but heavier) behaviour.
         return len(fetch_all_rows(table_name))
 
     return cached(("count", table_name), TTL_COUNT, load)
@@ -564,9 +575,8 @@ def _count_by_archive(table_name, archived):
             print(f"[Analytics] {key_name} count failed for {table_name}, "
                   f"falling back to full fetch: {e}")
 
-        rows = fetch_all_rows(table_name)
         total = 0
-        for r in rows:
+        for r in fetch_all_rows(table_name):
             flag = _to_bool_or_none(r.get(ARCHIVED_COL))
             is_archived_row = flag is not False  # True or unrecognised/NULL
             if is_archived_row == archived:
@@ -624,15 +634,11 @@ def _compute_summary():
     birth_total = totals["birth_records"]
     marriage_total = totals["marriage_records"]
     death_total = totals["death_records"]
-    total_all = birth_total + marriage_total + death_total
-
-    active_all = sum(active.values())
-    archived_all = sum(archived.values())
 
     return {
-        "total_records": total_all,
-        "active_records": active_all,
-        "archived_records": archived_all,
+        "total_records": birth_total + marriage_total + death_total,
+        "active_records": sum(active.values()),
+        "archived_records": sum(archived.values()),
         "total_birth_records": birth_total,
         "total_marriage_records": marriage_total,
         "total_death_records": death_total,
@@ -660,17 +666,10 @@ def _compute_summary():
     }
 
 
-def _compute_document_types():
-    return [
-        {"label": TYPE_LABELS[tbl], "count": _count_exact(tbl)}
-        for tbl in RECORD_TABLES
-    ]
-
-
 def _compute_records_by_year():
     years_map = defaultdict(int)
     for tbl in RECORD_TABLES:
-        for r in active_rows(tbl):
+        for r in fetch_all_rows(tbl):
             try:
                 ym = _resolve_upload_ym(r)
             except Exception as e:
@@ -682,19 +681,13 @@ def _compute_records_by_year():
 
 
 def _compute_records_by_month():
+    """Seasonality from persistent monthly history, so deletions never erase past months."""
     months_map = {m: 0 for m in range(1, 13)}
-    for tbl in RECORD_TABLES:
-        for r in active_rows(tbl):
-            try:
-                ym = _resolve_upload_ym(r)
-            except Exception as e:
-                print(f"[Analytics] records-by-month: skipping bad row in {tbl}: {e}")
-                continue
-            if ym:
-                months_map[ym[1]] += 1
+    for row in _fetch_monthly_history("records"):
+        months_map[int(row["month"])] += int(row["count"] or 0)
     return [
-        {"month_num": m_num, "month_name": MONTH_NAMES[m_num], "count": cnt}
-        for m_num, cnt in months_map.items()
+        {"month_num": m, "month_name": MONTH_NAMES[m], "count": c}
+        for m, c in months_map.items()
     ]
 
 
@@ -702,7 +695,7 @@ def _compute_top_municipalities():
     muni_map = {}
     for tbl in RECORD_TABLES:
         type_label = TYPE_LABELS[tbl]
-        for r in active_rows(tbl):
+        for r in fetch_all_rows(tbl):
             muni = _resolve_place(tbl, r)
             if muni not in muni_map:
                 muni_map[muni] = {"cnt": 0, "Birth": 0, "Marriage": 0, "Death": 0}
@@ -761,20 +754,13 @@ def _compute_requests_by_year():
 
 
 def _compute_requests_by_month():
+    """Seasonality from persistent monthly history, so deletions never erase past months."""
     months_map = {m: 0 for m in range(1, 13)}
-    for tbl in RECORD_TABLES:
-        for r in fetch_payment_rows(tbl):
-            try:
-                ym = _resolve_transaction_ym(tbl, r)
-            except Exception as e:
-                print(f"[Analytics] requests-by-month: skipping bad row in "
-                      f"{PAYMENT_TABLES[tbl]['table']}: {e}")
-                continue
-            if ym:
-                months_map[ym[1]] += 1
+    for row in _fetch_monthly_history("requests"):
+        months_map[int(row["month"])] += int(row["count"] or 0)
     return [
-        {"month_num": m_num, "month_name": MONTH_NAMES[m_num], "count": cnt}
-        for m_num, cnt in months_map.items()
+        {"month_num": m, "month_name": MONTH_NAMES[m], "count": c}
+        for m, c in months_map.items()
     ]
 
 
@@ -888,11 +874,6 @@ def requests_by_month():
 @analytics_bp.route("/api/analytics/growth-rate", methods=["GET"])
 def growth_rate():
     return _cached_route("growth-rate", TTL_AGG_HEAVY, _compute_growth_rate, "growth-rate")
-
-
-@analytics_bp.route("/api/analytics/document-types", methods=["GET"])
-def document_types():
-    return _cached_route("document-types", TTL_COUNT, _compute_document_types, "document-types")
 
 
 # ─────────────────────────────────────────────────────────────────────────
