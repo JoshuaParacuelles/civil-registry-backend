@@ -1,6 +1,11 @@
 # supabase_client.py
+import base64
+import json
 import os
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 try:
     from supabase import create_client, Client
@@ -12,14 +17,42 @@ except ImportError as e:
     print("=" * 60)
     raise
 
-url = os.environ.get("SUPABASE_URL")
-key = os.environ.get("SUPABASE_KEY")
+# Load .env from this file's folder (not the current terminal folder),
+# and override any stale variables already set in Windows.
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(ENV_PATH, override=True)
+
+url = os.environ.get("SUPABASE_URL", "").strip()
+key = os.environ.get("SUPABASE_KEY", "").strip()
+
+
+def describe_key(k: str) -> str:
+    """Describe the key type without printing the key itself."""
+    if k.startswith("sb_secret_"):
+        return "SECRET (correct for backend)"
+    if k.startswith("sb_publishable_"):
+        return "PUBLISHABLE (wrong for backend, needs secret key)"
+    if k.startswith("eyJ"):
+        try:
+            payload = k.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            role = json.loads(base64.urlsafe_b64decode(payload)).get("role")
+            return f"LEGACY JWT, role={role} (backend needs service_role)"
+        except Exception:
+            return "LEGACY JWT (role unknown)"
+    return "UNKNOWN"
+
+
+print(f"[SUPABASE_CLIENT] .env path: {ENV_PATH} (exists: {ENV_PATH.exists()})")
+print(f"[SUPABASE_CLIENT] SUPABASE_URL set: {bool(url)}")
+print(f"[SUPABASE_CLIENT] SUPABASE_KEY set: {bool(key)}, length: {len(key)}")
+if key:
+    print(f"[SUPABASE_CLIENT] SUPABASE_KEY type: {describe_key(key)}")
 
 if not url or not key:
     raise ValueError(
-        "SUPABASE_URL and SUPABASE_KEY must be set in environment variables. "
-        f"URL set: {bool(url)}, KEY set: {bool(key)}. "
-        "Check that load_dotenv() ran BEFORE this module is imported."
+        "SUPABASE_URL and SUPABASE_KEY must be set in the backend .env file. "
+        f"URL set: {bool(url)}, KEY set: {bool(key)}."
     )
 
 try:
