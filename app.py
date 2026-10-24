@@ -36,6 +36,7 @@ from auth.marriage_password import marriage_auth_bp, init_marriage_archive_db
 from logs.Audits import audit_bp, init_audit_db, record_action, mark_denial_logged
 from auth.Rolemanagement import role_bp, init_roles_db
 from routes.profile_routes import profile_bp
+
 app = Flask(__name__)
 
 # Compress JSON/HTML/CSS/JS responses. PDFs are not in the default mimetype
@@ -114,10 +115,15 @@ ALLOWED_ORIGINS = [
     'http://localhost:5000',
     'http://localhost:5173',
     'http://localhost:5174',
+    'http://localhost:4173',   # vite preview
+    'http://localhost:4174',   # vite preview (fallback port)
     'http://127.0.0.1:3000',
     'http://127.0.0.1:5000',
     'http://127.0.0.1:5173',
     'http://127.0.0.1:5174',
+    'http://127.0.0.1:4173',
+    'http://127.0.0.1:4174',
+    'https://civil-registry-app.onrender.com',  # deployed frontend
     'app://civil-registry',   # Electron desktop app
 ]
 

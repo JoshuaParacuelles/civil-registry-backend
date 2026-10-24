@@ -597,22 +597,24 @@ def init_roles_db():
 
 @role_bp.route("/api/heartbeat", methods=["POST"])
 def heartbeat():
-    """Called periodically by the logged-in app. Only refreshes last_seen; it
-    never sets is_online, so a heartbeat arriving after logout cannot revive
-    a session. Scoped to the credential the user logged in with, when the
-    session records it."""
-    username = session.get("username")
-    if not username:
+    """Called periodically while the app is open. Refreshes last_seen and
+    sets is_online. Keyed by user_id, which login.py stores in the session,
+    so it updates exactly the credential that logged in.
+
+    After logout session.clear() runs, so a late heartbeat gets 401 and
+    cannot revive the session."""
+    user_id = session.get("user_id")
+    if not user_id:
         return jsonify({"error": "Not logged in"}), 401
 
     if not _LAST_SEEN_PROBE.available():
         return jsonify({"ok": False, "reason": "migration_required"})
 
-    q = supabase.table("users").update({"last_seen": now_iso()}).eq("username", username)
-    category = session.get("category")
-    if category in KNOWN_CATEGORIES and _USER_CATEGORY_PROBE.available():
-        q = q.eq("category", category)
-    _exec(q)
+    _exec(
+        supabase.table("users")
+        .update({"last_seen": now_iso(), "is_online": True})
+        .eq("id", user_id)
+    )
     return jsonify({"ok": True})
 
 

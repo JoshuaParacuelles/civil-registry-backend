@@ -141,7 +141,6 @@ def _save_local_user(user, role_names, permissions):
     try:
         data = _load_local_users()
         key = user["username"].strip().lower()
-        previous = data.get(key, {})
         data[key] = {
             "id": user["id"],
             "username": user["username"],
@@ -152,8 +151,6 @@ def _save_local_user(user, role_names, permissions):
             "fail_count": 0,
             "locked_until": None,
         }
-        # keep nothing else from the previous record; it is fully refreshed
-        _ = previous
         _write_local_users(data)
     except Exception as e:
         print(f"[LOCAL CACHE ERROR] {e}")
@@ -563,9 +560,13 @@ def login():
         print(f"[LOGIN] Session set for user: {username}")
 
         # Successful login fully resets the attempt/lockout state.
+        # last_seen is set here too, so the account shows Active immediately
+        # instead of waiting for the first heartbeat.
         try:
+            now = now_iso()
             update_data = {
-                'last_login': now_iso(),
+                'last_login': now,
+                'last_seen': now,
                 'is_online': True,
                 'login_attempts': 0,
                 'lock_level': 0,
@@ -627,6 +628,7 @@ def logout():
                 supabase.table('users')\
                     .update({
                         'is_online': False,
+                        'last_seen': None,
                         'last_logout': now_iso()
                     })\
                     .eq('id', user_id)\
@@ -654,13 +656,14 @@ def logout():
 
 @login_bp.route('/api/logout-beacon', methods=['POST'])
 def logout_beacon():
-    """Update presence on page hide without treating it as an explicit logout."""
+    """Page was hidden or closed. Clear last_seen so the account shows Not
+    Active right away. is_online is left as-is, so a reload restores Active
+    on the next heartbeat."""
     user_id = session.get('user_id')
     if user_id:
         try:
             supabase.table('users').update({
-                'is_online': False,
-                'last_logout': now_iso(),
+                'last_seen': None,
             }).eq('id', user_id).execute()
         except Exception as e:
             print(f"[LOGOUT BEACON UPDATE ERROR] {e}")
