@@ -2,7 +2,7 @@
 # Rolemanagement.py
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 import httpx
@@ -22,10 +22,6 @@ print("[ROLES] Using Supabase tables 'roles' / 'user_roles' / 'users'")
 # ─────────────────────────────────────────────
 # DOCUMENT TRACKING STAGE MODULES
 # ─────────────────────────────────────────────
-# One granular module per Document Tracking pipeline stage, so a user can be
-# scoped to exactly one stage (mirrors how "birth_verification" scopes a
-# Birth Verifier to only the Birth module in Vital Records Management).
-# "document_tracking" itself is also added to ALL_MODULES below.
 DOCUMENT_TRACKING_STAGE_MODULES = {
     "document_stage_registration":     "Registration",
     "document_stage_civil_registrar":  "Civil Registrar",
@@ -62,10 +58,8 @@ ADMIN_ONLY_MODULES = {"role_management", "user_management", "audit_logs"}
 # ─────────────────────────────────────────────
 # CREDENTIAL CATEGORIES
 # ─────────────────────────────────────────────
-# Vital Record Management Credentials and Document Tracking Credentials are
-# completely independent slots: a single username may hold ONE role in
-# EACH category at the same time. This mirrors CATEGORY_MODULES on the
-# frontend (RoleManagement.jsx).
+# Vital Record Management and Document Tracking credentials are independent
+# slots: one username may hold ONE role in EACH category at the same time.
 CATEGORY_MODULES = {
     "vital": {
         "birth_verification",
@@ -78,15 +72,13 @@ CATEGORY_MODULES = {
     "document": set(DOCUMENT_TRACKING_STAGE_MODULES.keys()) | {"document_tracking"},
 }
 
-# Every category value this file may ever write into user_roles.category or
-# users.category.
 KNOWN_CATEGORIES = {"vital", "document", "admin", "other"}
 
 
 def get_role_category(role: dict) -> str:
     """Which independent credential category a role belongs to. Administrator
     (or any role granting role_management/user_management) is its own
-    'admin' category, separate from both Vital and Document credentials."""
+    'admin' category."""
     perms = set(parse_permissions(role.get("permissions")))
     if role.get("name") == "Administrator" or "role_management" in perms or "user_management" in perms:
         return "admin"
@@ -97,15 +89,21 @@ def get_role_category(role: dict) -> str:
     return "other"
 
 
-# The bootstrap super-admin account. Always has full access (see is_admin())
-# and never appears in the Role Management user list.
+# The bootstrap super-admin account. Always has full access and never appears
+# in the Role Management user list.
 RESERVED_ADMIN_USERNAME = "admin"
+
+# ─────────────────────────────────────────────
+# ACTIVITY / ONLINE STATUS
+# ─────────────────────────────────────────────
+# An account counts as Active only when its login flag is set AND it has sent
+# a heartbeat within this window. A closed or crashed app stops heartbeating,
+# so the account turns Not Active without needing an explicit logout.
+ONLINE_TIMEOUT_SECONDS = 120
 
 # ─────────────────────────────────────────────
 # TWO-ADMINISTRATOR CAP
 # ─────────────────────────────────────────────
-# In addition to the reserved bootstrap "admin" account, exactly
-# MAX_ADMINISTRATORS regular users may hold the Administrator role at any time.
 MAX_ADMINISTRATORS = 2
 
 BUILTIN_ROLE_PERMISSIONS = {
@@ -128,7 +126,6 @@ BUILTIN_ROLE_PERMISSIONS = {
         "marriage_archive_uploader",
         "change_password",
     ],
-    # ─── DOCUMENT TRACKING STAGE ROLES ─────────────────────────────────────
     "Registration": [
         "dashboard",
         "document_tracking",
@@ -169,44 +166,23 @@ BUILTIN_ROLE_PERMISSIONS = {
 
 
 def _with_offline_sync(name, perms):
-    """Every built-in role except Administrator (which already has every module)
-    gets offline_sync, so its personnel can open Offline Data & Sync."""
+    """Every built-in role except Administrator gets offline_sync."""
     perms = list(perms)
     if name != "Administrator" and "offline_sync" not in perms:
         perms.append("offline_sync")
     return perms
 
 
-# Apply offline_sync to every built-in role.
 BUILTIN_ROLE_PERMISSIONS = {
     name: _with_offline_sync(name, perms)
     for name, perms in BUILTIN_ROLE_PERMISSIONS.items()
 }
 
-VERIFIER_ALLOWED = {
-    "Birth Verifier":    {"dashboard", "birth_verification",    "birth_archive_uploader",    "change_password"},
-    "Death Verifier":    {"dashboard", "death_verification",    "death_archive_uploader",    "change_password"},
-    "Marriage Verifier": {"dashboard", "marriage_verification", "marriage_archive_uploader", "change_password"},
-}
-
-# ─────────────────────────────────────────────
-# DOCUMENT TRACKING STAGE ALLOWLIST
-# ─────────────────────────────────────────────
-DOC_STAGE_ALLOWED = {
-    "Registration":           {"dashboard", "document_tracking", "document_stage_registration",     "change_password"},
-    "Civil Registrar":        {"dashboard", "document_tracking", "document_stage_civil_registrar",  "change_password"},
-    "Posting Period":         {"dashboard", "document_tracking", "document_stage_posting_period",   "change_password"},
-    "Records Division":       {"dashboard", "document_tracking", "document_stage_records_division", "change_password"},
-    "Assign Registry Number": {"dashboard", "document_tracking", "document_stage_registry_number",  "change_password"},
-    "Releasing":              {"dashboard", "document_tracking", "document_stage_releasing",        "change_password"},
-}
-
 # --- SUPABASE RETRY WRAPPER ---------------------------------------------------
 #
-# On Windows, the httpx client used internally by the Supabase Python SDK can
-# intermittently raise httpx.ReadError (WinError 10035). This is a transient
-# socket hiccup, so `_exec()` retries a couple of times before giving up, and
-# the blueprint-level error handler guarantees failures come back as JSON.
+# The httpx client used by the Supabase SDK can intermittently raise transient
+# socket errors on Windows (WinError 10035). _exec() retries those before
+# giving up, and the blueprint error handler returns failures as JSON.
 
 TRANSIENT_ERRORS = (
     httpx.HTTPError,
@@ -234,7 +210,6 @@ def _exec(query, retries=3, base_delay=0.3):
 
 @role_bp.errorhandler(Exception)
 def _handle_role_bp_error(e):
-    # Let normal HTTP errors (404, 401, etc. raised via abort()) behave as usual.
     if isinstance(e, HTTPException):
         return e
     print(f"[ROLES] Unhandled error: {e!r}")
@@ -244,7 +219,73 @@ def _handle_role_bp_error(e):
     }), 503
 
 
-# --- HELPERS -------------------------------------------------------------
+# --- SCHEMA PROBES ------------------------------------------------------------
+#
+# Checks whether an optional column exists. A True result is cached for good.
+# A False result is cached briefly, so applying a migration takes effect
+# without a restart. Transient network errors are re-raised and not cached.
+
+class _SchemaProbe:
+    RECHECK_SECONDS = 60.0
+
+    def __init__(self, table: str, column: str):
+        self.table = table
+        self.column = column
+        self._ok = None
+        self._probed_at = 0.0
+
+    def available(self) -> bool:
+        if self._ok is True:
+            return True
+        if self._ok is False and (time.time() - self._probed_at) < self.RECHECK_SECONDS:
+            return False
+        try:
+            _exec(supabase.table(self.table).select(self.column).limit(1))
+            self._ok = True
+        except TRANSIENT_ERRORS:
+            raise
+        except Exception as e:
+            print(f"[ROLES] {self.table}.{self.column} not available: {e!r}")
+            self._ok = False
+        self._probed_at = time.time()
+        return self._ok
+
+
+_CATEGORY_PROBE = _SchemaProbe("user_roles", "category")
+_USER_CATEGORY_PROBE = _SchemaProbe("users", "category")
+_LAST_SEEN_PROBE = _SchemaProbe("users", "last_seen")
+
+MIGRATION_REQUIRED_ERROR = (
+    "Database migration required: the 'user_roles' table has no 'category' "
+    "column. Run the 'MIGRATION: CREDENTIAL CATEGORY SEPARATION' section of "
+    "schema.sql. Until then, the same username cannot hold separate Vital "
+    "Record Management and Document Tracking credentials."
+)
+
+USERS_MIGRATION_REQUIRED_ERROR = (
+    "Database migration required: the 'users' table has no 'category' "
+    "column. Run the 'MIGRATION: PER-CATEGORY PASSWORDS' section of "
+    "schema.sql. Until then, the same username cannot hold a separate "
+    "password per credential category."
+)
+
+USERS_MIGRATION_NOTICE = (
+    "Note: the 'users' table has no 'category' column yet, so this username "
+    "shares ONE password across all credential categories. Run the "
+    "'MIGRATION: PER-CATEGORY PASSWORDS' section of schema.sql to give each "
+    "category its own separate password. The role assignment itself is "
+    "correctly scoped and unaffected."
+)
+
+LAST_SEEN_MIGRATION_NOTICE = (
+    "Database migration required: the 'users' table has no 'last_seen' column. "
+    "Run: alter table public.users add column if not exists last_seen timestamptz; "
+    "Until then, Active status falls back to the login flag only and can show "
+    "stale 'Active' accounts."
+)
+
+
+# --- HELPERS -------------------------------------------------------------------
 
 def parse_permissions(perm_val):
     if not perm_val:
@@ -292,106 +333,32 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_ts(value):
+    """Parse a Supabase timestamp into an aware datetime (naive values are UTC)."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _seen_recently(last_seen_value, now: datetime) -> bool:
+    dt = _parse_ts(last_seen_value)
+    if dt is None:
+        return False
+    return (now - dt) <= timedelta(seconds=ONLINE_TIMEOUT_SECONDS)
+
+
 def _first(resp):
     data = getattr(resp, "data", None)
     return data[0] if data else None
-
-
-# ─────────────────────────────────────────────
-# SCHEMA GUARD: user_roles.category
-# ─────────────────────────────────────────────
-# Category-scoped deletes depend on user_roles.category existing. If the
-# migration hasn't been applied, refuse the write rather than risk an
-# unscoped delete.
-_CATEGORY_COLUMN_OK = None
-_CATEGORY_PROBED_AT = 0.0
-_CATEGORY_RECHECK_SECONDS = 60.0
-
-
-def _category_column_available() -> bool:
-    """True when user_roles.category exists. A True result is cached
-    permanently; a False result is cached only briefly so applying the
-    migration takes effect without a restart."""
-    global _CATEGORY_COLUMN_OK, _CATEGORY_PROBED_AT
-
-    if _CATEGORY_COLUMN_OK is True:
-        return True
-    if (
-        _CATEGORY_COLUMN_OK is False
-        and (time.time() - _CATEGORY_PROBED_AT) < _CATEGORY_RECHECK_SECONDS
-    ):
-        return False
-
-    try:
-        _exec(supabase.table("user_roles").select("category").limit(1))
-        _CATEGORY_COLUMN_OK = True
-    except TRANSIENT_ERRORS:
-        # Network hiccup, not a schema problem — don't cache a false negative.
-        raise
-    except Exception as e:
-        print(f"[ROLES] user_roles.category not available: {e!r}")
-        _CATEGORY_COLUMN_OK = False
-    _CATEGORY_PROBED_AT = time.time()
-    return _CATEGORY_COLUMN_OK
-
-
-MIGRATION_REQUIRED_ERROR = (
-    "Database migration required: the 'user_roles' table has no 'category' "
-    "column. Run the 'MIGRATION: CREDENTIAL CATEGORY SEPARATION' section of "
-    "schema.sql. Until then, the same username cannot hold separate Vital "
-    "Record Management and Document Tracking credentials."
-)
-
-
-# ─────────────────────────────────────────────
-# SCHEMA GUARD: users.category
-# ─────────────────────────────────────────────
-# Per-category passwords depend on this column. Not fatal: credential
-# creation falls back to the legacy shared-password behaviour without it.
-_USER_CATEGORY_COLUMN_OK = None
-_USER_CATEGORY_PROBED_AT = 0.0
-_USER_CATEGORY_RECHECK_SECONDS = 60.0
-
-
-def _user_category_column_available() -> bool:
-    """True when users.category exists. A True result is cached permanently;
-    a False result is cached only briefly."""
-    global _USER_CATEGORY_COLUMN_OK, _USER_CATEGORY_PROBED_AT
-
-    if _USER_CATEGORY_COLUMN_OK is True:
-        return True
-    if (
-        _USER_CATEGORY_COLUMN_OK is False
-        and (time.time() - _USER_CATEGORY_PROBED_AT) < _USER_CATEGORY_RECHECK_SECONDS
-    ):
-        return False
-
-    try:
-        _exec(supabase.table("users").select("category").limit(1))
-        _USER_CATEGORY_COLUMN_OK = True
-    except TRANSIENT_ERRORS:
-        raise
-    except Exception as e:
-        print(f"[ROLES] users.category not available: {e!r}")
-        _USER_CATEGORY_COLUMN_OK = False
-    _USER_CATEGORY_PROBED_AT = time.time()
-    return _USER_CATEGORY_COLUMN_OK
-
-
-USERS_MIGRATION_REQUIRED_ERROR = (
-    "Database migration required: the 'users' table has no 'category' "
-    "column. Run the 'MIGRATION: PER-CATEGORY PASSWORDS' section of "
-    "schema.sql. Until then, the same username cannot hold a separate "
-    "password per credential category."
-)
-
-USERS_MIGRATION_NOTICE = (
-    "Note: the 'users' table has no 'category' column yet, so this username "
-    "shares ONE password across all credential categories. Run the "
-    "'MIGRATION: PER-CATEGORY PASSWORDS' section of schema.sql to give each "
-    "category its own separate password. The role assignment itself is "
-    "correctly scoped and unaffected."
-)
 
 
 def _delete_user_role_scoped(username: str, category: str):
@@ -420,15 +387,13 @@ def get_role_by_id(role_id):
 
 
 def get_user_by_username(username):
-    """Any account row for this username, in any category (first match).
-    Only for existence checks that are NOT about one specific credential."""
+    """Any account row for this username, in any category (first match)."""
     resp = _exec(supabase.table("users").select("*").eq("username", username))
     return _first(resp)
 
 
 def get_user_by_username_category(username, category):
-    """The specific account row for (username, category). Each credential
-    category has its own password and lock state."""
+    """The account row for (username, category)."""
     resp = _exec(
         supabase.table("users")
         .select("*")
@@ -439,8 +404,8 @@ def get_user_by_username_category(username, category):
 
 
 def get_current_admin_usernames():
-    """Usernames (EXCLUDING the reserved bootstrap 'admin' account) that
-    currently hold the Administrator role, ordered by assignment time."""
+    """Usernames (excluding the reserved bootstrap 'admin') holding the
+    Administrator role, ordered by assignment time."""
     admin_role = get_role_by_name("Administrator")
     if not admin_role:
         return []
@@ -457,8 +422,6 @@ def get_current_admin_usernames():
 # --- PERMISSION HELPERS ------------------------------------------------------
 
 def get_user_permissions(username: str) -> list:
-    # A username can hold up to one role per category, so permissions from
-    # every matching user_roles row are unioned together (order-preserving).
     resp = _exec(
         supabase.table("user_roles")
         .select("roles(permissions)")
@@ -487,11 +450,8 @@ def is_admin(username: str) -> bool:
         return False
     if username.lower() == RESERVED_ADMIN_USERNAME:
         return True
-
     perms = get_user_permissions(username)
-    result = "role_management" in perms or "user_management" in perms
-    print(f"[ADMIN-CHECK] '{username}' is_admin = {result}")
-    return result
+    return "role_management" in perms or "user_management" in perms
 
 
 def require_permission(module: str):
@@ -516,13 +476,12 @@ def require_permission(module: str):
 # --- BACKFILL ---------------------------------------------------------------
 
 def backfill_offline_sync_on_roles():
-    """Give offline_sync to every non-Administrator role that lacks it,
-    including custom roles that were created before the permission existed.
-    Touches only roles.permissions. Never changes users or user_roles."""
+    """Give offline_sync to every non-Administrator role that lacks it.
+    Touches only roles.permissions."""
     resp = _exec(supabase.table("roles").select("id, name, permissions"))
     for r in (resp.data or []):
         if r["name"] == "Administrator":
-            continue  # already has every module
+            continue
         perms = parse_permissions(r["permissions"])
         if "offline_sync" in perms:
             continue
@@ -571,27 +530,25 @@ def init_roles_db():
         except Exception as e:
             print(f"[init] Could not enforce permissions for role {name}: {e}")
 
-    # ─────────────────────────────────────────────
-    # STARTUP CHECK: credential category separation
-    # ─────────────────────────────────────────────
-    if not _category_column_available():
+    # STARTUP CHECK: schema migrations
+    if not _CATEGORY_PROBE.available():
         print("[init] *** " + MIGRATION_REQUIRED_ERROR + " ***")
-    if not _user_category_column_available():
+    if not _USER_CATEGORY_PROBE.available():
         print("[init] *** " + USERS_MIGRATION_REQUIRED_ERROR + " ***")
         print("[init] *** Credentials can still be created — they will share "
               "one password per username until this migration is applied. ***")
+    if not _LAST_SEEN_PROBE.available():
+        print("[init] *** " + LAST_SEEN_MIGRATION_NOTICE + " ***")
 
-    # ─────────────────────────────────────────────
-    # NOTE: is_online is intentionally NOT reset here. It is only set False
-    # by an explicit /api/logout or /api/logout-beacon call, so a server
-    # restart never flips a logged-in administrator to "Not Active".
-    # ─────────────────────────────────────────────
+    # NOTE: is_online is intentionally NOT reset here. It is only cleared by an
+    # explicit logout. Active status is also gated by last_seen (see heartbeat).
 
     admin_role = get_role_by_name("Administrator")
     if admin_role:
         admin_role_id = admin_role["id"]
+        users_scoped = _USER_CATEGORY_PROBE.available()
 
-        if _user_category_column_available():
+        if users_scoped:
             puser = get_user_by_username_category(RESERVED_ADMIN_USERNAME, "admin")
         else:
             puser = get_user_by_username(RESERVED_ADMIN_USERNAME)
@@ -602,7 +559,7 @@ def init_roles_db():
                     "username": RESERVED_ADMIN_USERNAME,
                     "password": hash_password("admin123"),
                 }
-                if _user_category_column_available():
+                if users_scoped:
                     insert_payload["category"] = "admin"
                 _exec(supabase.table("users").insert(insert_payload))
                 print("[init] Created user: admin")
@@ -612,13 +569,11 @@ def init_roles_db():
             q = supabase.table("users").update({
                 "password": hash_password("admin123")
             }).eq("username", RESERVED_ADMIN_USERNAME)
-            if _user_category_column_available():
+            if users_scoped:
                 q = q.eq("category", "admin")
             _exec(q)
             print("[init] Re-hashed password for admin")
 
-        # Admin still gets an Administrator row in user_roles, scoped to the
-        # admin category only, so no Vital or Document rows are touched.
         try:
             _delete_user_role_scoped(RESERVED_ADMIN_USERNAME, "admin")
             _exec(supabase.table("user_roles").insert({
@@ -630,13 +585,35 @@ def init_roles_db():
         except Exception as e:
             print(f"[init] Could not assign Administrator role to admin: {e!r}")
 
-    # Give offline_sync to any role (including custom roles) that lacks it.
     try:
         backfill_offline_sync_on_roles()
     except Exception as e:
         print(f"[init] offline_sync backfill failed: {e!r}")
 
     print("[init] roles DB initialised — OK")
+
+
+# --- ROUTES: ACTIVITY HEARTBEAT ----------------------------------------------
+
+@role_bp.route("/api/heartbeat", methods=["POST"])
+def heartbeat():
+    """Called periodically by the logged-in app. Only refreshes last_seen; it
+    never sets is_online, so a heartbeat arriving after logout cannot revive
+    a session. Scoped to the credential the user logged in with, when the
+    session records it."""
+    username = session.get("username")
+    if not username:
+        return jsonify({"error": "Not logged in"}), 401
+
+    if not _LAST_SEEN_PROBE.available():
+        return jsonify({"ok": False, "reason": "migration_required"})
+
+    q = supabase.table("users").update({"last_seen": now_iso()}).eq("username", username)
+    category = session.get("category")
+    if category in KNOWN_CATEGORIES and _USER_CATEGORY_PROBE.available():
+        q = q.eq("category", category)
+    _exec(q)
+    return jsonify({"ok": True})
 
 
 # --- ROUTES: ROLES -----------------------------------------------------------
@@ -787,9 +764,6 @@ def update_role(role_id):
         resource_id=role_id,
     )
 
-    # Snapshot old per-username categories for this role BEFORE updating, so
-    # that if the edit moves the role into a different category we know which
-    # users rows need to follow it.
     try:
         pre_update_rows = _exec(
             supabase.table("user_roles").select("username, category").eq("role_id", role_id)
@@ -807,8 +781,6 @@ def update_role(role_id):
     except Exception as e:
         return jsonify({"error": f"Could not update role: {e}"}), 500
 
-    # Editing a role's permissions can move it into a different credential
-    # category. Existing assignment rows must follow it.
     try:
         updated = get_role_by_id(role_id) or {}
         new_category = get_role_category(updated)
@@ -816,10 +788,7 @@ def update_role(role_id):
             "category": new_category,
         }).eq("role_id", role_id))
 
-        # users.category re-sync: move the account row to match, but only when
-        # doing so cannot collide with an independent credential the same
-        # username already holds in the destination category.
-        if _user_category_column_available():
+        if _USER_CATEGORY_PROBE.available():
             for row in pre_update_rows:
                 uname   = row.get("username")
                 old_cat = row.get("category")
@@ -867,7 +836,6 @@ def delete_role(role_id):
         resource_id=role_id,
     )
 
-    # Scoped by role_id, so only assignments OF THIS ROLE go away.
     _exec(supabase.table("user_roles").delete().eq("role_id", role_id))
     _exec(supabase.table("roles").delete().eq("id", role_id))
     return jsonify({"message": "Role deleted"})
@@ -889,8 +857,6 @@ def get_modules():
 @require_admin
 @audit_action("PERSONNEL_VIEWED", resource_type="account", dedupe_window_seconds=300)
 def get_administrators():
-    """Current holders of the (capped) Administrator role, excluding the
-    reserved bootstrap 'admin' account."""
     return jsonify({
         "administrators": get_current_admin_usernames(),
         "max": MAX_ADMINISTRATORS,
@@ -901,9 +867,6 @@ def get_administrators():
 @require_admin
 @audit_action("ADMINISTRATORS_UPDATED", resource_type="account")
 def set_administrators():
-    """Sets EXACTLY the two Administrator slots to the given usernames.
-    Every delete is scoped to category="admin" so Vital or Document roles
-    held by the same usernames are never disturbed."""
     data  = request.json or {}
     slot1 = (data.get("slot1_username") or "").strip()
     slot2 = (data.get("slot2_username") or "").strip()
@@ -926,7 +889,7 @@ def set_administrators():
         return jsonify({"error": "Administrator role not found"}), 500
     admin_role_id = admin_role["id"]
 
-    if not _category_column_available():
+    if not _CATEGORY_PROBE.available():
         return jsonify({"error": MIGRATION_REQUIRED_ERROR}), 500
 
     current_admins = get_current_admin_usernames()
@@ -960,7 +923,7 @@ def set_administrators():
 @audit_action("PERSONNEL_VIEWED", resource_type="user_role", dedupe_window_seconds=300)
 def get_user_roles():
     select_cols = "id, username, category, assigned_at, roles(id, name, permissions)"
-    if not _category_column_available():
+    if not _CATEGORY_PROBE.available():
         select_cols = "id, username, assigned_at, roles(id, name, permissions)"
 
     resp = _exec(
@@ -970,32 +933,43 @@ def get_user_roles():
         .order("id")
     )
     rows = resp.data or []
-
     usernames = [r["username"] for r in rows]
 
-    # Lock/online lookup is keyed by (username, category) so one category's
-    # lock state never bleeds into the other's row for the same username.
-    users_scoped = _user_category_column_available()
+    users_scoped = _USER_CATEGORY_PROBE.available()
+    seen_available = _LAST_SEEN_PROBE.available()
+
     lock_info = {}
     if usernames:
-        select_users_cols = "username, category, login_attempts, lock_time, lock_level, is_online, last_login, last_logout"
-        if not users_scoped:
-            select_users_cols = "username, login_attempts, lock_time, lock_level, is_online, last_login, last_logout"
+        cols = ["username", "login_attempts", "lock_time", "lock_level",
+                "is_online", "last_login", "last_logout"]
+        if users_scoped:
+            cols.insert(1, "category")
+        if seen_available:
+            cols.append("last_seen")
+
         uresp = _exec(
             supabase.table("users")
-            .select(select_users_cols)
+            .select(", ".join(cols))
             .in_("username", usernames)
         )
         for u in (uresp.data or []):
             key = (u["username"], u.get("category")) if users_scoped else u["username"]
             lock_info[key] = u
 
+    now = datetime.now(timezone.utc)
     out = []
     for r in rows:
         role = _unwrap_relation(r.get("roles")) or {}
         perms = parse_permissions(role.get("permissions"))
         category = r.get("category") or (get_role_category(role) if role else "other")
         info = lock_info.get((r["username"], category) if users_scoped else r["username"], {})
+
+        # Active = login flag set AND a recent heartbeat. Without the last_seen
+        # column there is no way to tell a live session from a stale one, so
+        # the flag alone is used (and a startup warning is printed).
+        login_flag = bool(info.get("is_online", False))
+        is_online = login_flag and _seen_recently(info.get("last_seen"), now) if seen_available else login_flag
+
         out.append({
             "id":             r["id"],
             "username":       r["username"],
@@ -1008,7 +982,8 @@ def get_user_roles():
             "login_attempts": info.get("login_attempts", 0),
             "lock_level":     info.get("lock_level", 0),
             "lock_time":      str(info.get("lock_time") or ""),
-            "is_online":      bool(info.get("is_online", False)),
+            "is_online":      is_online,
+            "last_seen":      str(info.get("last_seen") or ""),
             "last_login":     str(info.get("last_login") or ""),
             "last_logout":    str(info.get("last_logout") or ""),
         })
@@ -1034,8 +1009,6 @@ def assign_role():
     if not role:
         return jsonify({"error": "Role not found"}), 404
 
-    # Two-administrator cap, enforced on the generic path too so it cannot be
-    # bypassed by calling this route directly.
     if role["name"] == "Administrator":
         current_admins = get_current_admin_usernames()
         already_admin = username in current_admins
@@ -1047,17 +1020,12 @@ def assign_role():
                 )
             }), 400
 
-    # Refuse to write if the user_roles.category migration hasn't been applied,
-    # since an unscoped delete is what used to wipe a user's other credentials.
     category = get_role_category(role)
-    if not _category_column_available():
+    if not _CATEGORY_PROBE.available():
         return jsonify({"error": MIGRATION_REQUIRED_ERROR}), 500
     if category not in KNOWN_CATEGORIES:
         return jsonify({"error": f"Unrecognised credential category '{category}'"}), 400
 
-    # One holder per role per category. Checked BEFORE any account is created,
-    # so a rejected role never leaves a new login behind. Administrator is
-    # exempt because the two-slot cap above governs it.
     if category != "admin":
         holders = [
             r["username"]
@@ -1077,18 +1045,15 @@ def assign_role():
                 )
             }), 409
 
-    # Per-category passwords. Without users.category, fall back to the legacy
-    # shared-password behaviour instead of failing outright.
-    users_scoped = _user_category_column_available()
+    users_scoped = _USER_CATEGORY_PROBE.available()
 
     try:
-        previous_query = (
+        previous_assignment = _exec(
             supabase.table("user_roles")
             .select("username, role_id, category")
             .eq("username", username)
             .eq("category", category)
-        )
-        previous_assignment = _exec(previous_query).data or []
+        ).data or []
     except Exception as e:
         previous_assignment = []
         print(f"[ROLES] Could not read previous assignment for audit: {e!r}")
@@ -1139,8 +1104,6 @@ def assign_role():
                     ),
                     "detail": str(e),
                 }), 500
-    # If a credential already exists for this category, its password is left
-    # untouched. Changing it goes through reset_password.
 
     set_audit_context(
         old_value=previous_assignment[0] if previous_assignment else None,
@@ -1154,14 +1117,8 @@ def assign_role():
         resource_id=username,
     )
 
-    # Snapshot other categories so we can confirm nothing outside this
-    # category was touched.
     before_other = _other_category_rows(username, category)
 
-    # Upsert on (username, category): the existing row for this category is
-    # updated in place, so the user never loses their current role if the
-    # write is rejected. The database's unique index is the final guard
-    # against two admins assigning the same role at the same moment.
     try:
         _exec(
             supabase.table("user_roles").upsert(
@@ -1186,9 +1143,6 @@ def assign_role():
         print(f"[ROLES] assign_role failed for '{username}' ({category}): {e!r}")
         return jsonify({"error": f"Could not assign role: {e}"}), 500
 
-    # Only when a NEW credential was created with this password. If the
-    # credential already existed, the submitted password was ignored by the
-    # server, so writing a record here would encrypt with the wrong password.
     if account_created and password:
         _write_offline_record(username, category, password, role)
 
@@ -1235,8 +1189,7 @@ def _other_category_rows(username: str, category: str) -> dict:
 
 
 def _write_offline_record(username, category, password, role):
-    """Store the encrypted offline record for one (username, category) credential.
-    The password must be the one the server just stored for that credential."""
+    """Store the encrypted offline record for one (username, category) credential."""
     perms = set(parse_permissions(role.get("permissions")))
     is_admin_role = "role_management" in perms
     permissions = perms | {"dashboard"}
@@ -1252,7 +1205,7 @@ def _write_offline_record(username, category, password, role):
     try:
         record = build_offline_record(password, profile)
         q = supabase.table("users").update({"offline_record": record}).eq("username", username)
-        if _user_category_column_available():
+        if _USER_CATEGORY_PROBE.available():
             q = q.eq("category", category)
         _exec(q)
     except Exception as e:
@@ -1280,9 +1233,6 @@ def remove_user_role(username):
     if username.lower() == RESERVED_ADMIN_USERNAME:
         return jsonify({"error": "Cannot remove the reserved admin account"}), 400
 
-    # The frontend passes ?category= AND ?role_id= so only that one
-    # category's assignment is deleted. Neither filter alone is ever allowed
-    # to degrade into "remove every role this username holds".
     role_id  = request.args.get("role_id")
     category = request.args.get("category")
 
@@ -1297,7 +1247,7 @@ def remove_user_role(username):
     if category and category not in KNOWN_CATEGORIES:
         return jsonify({"error": f"Unrecognised credential category '{category}'"}), 400
 
-    category_filter_applicable = bool(category) and _category_column_available()
+    category_filter_applicable = bool(category) and _CATEGORY_PROBE.available()
 
     if not role_id and not category_filter_applicable:
         return jsonify({
@@ -1336,8 +1286,7 @@ def remove_user_role(username):
         query = query.eq("category", category)
     _exec(query)
 
-    # Intentionally does NOT delete the matching users (login) row. Removing a
-    # role assignment revokes access; it does not delete the account/password.
+    # Does NOT delete the users (login) row. Removing a role revokes access only.
     return jsonify({"message": f"Role removed from '{username}'"})
 
 
@@ -1352,9 +1301,7 @@ def reset_password(username):
     if not password:
         return jsonify({"error": "New password is required"}), 400
 
-    # Each category is its own account, so `category` scopes this update to
-    # exactly one credential.
-    if _user_category_column_available():
+    if _USER_CATEGORY_PROBE.available():
         if not category or category not in KNOWN_CATEGORIES:
             return jsonify({"error": "A valid category is required to reset this credential's password"}), 400
         existing_user = get_user_by_username_category(username, category)
@@ -1378,8 +1325,6 @@ def reset_password(username):
         if role:
             _write_offline_record(username, category, password, role)
     else:
-        # Pre-migration fallback: one shared account per username. `category`
-        # is ignored rather than rejected.
         existing_user = get_user_by_username(username)
         if not existing_user:
             return jsonify({"error": "User not found"}), 404
@@ -1403,11 +1348,9 @@ def reset_password(username):
 @require_admin
 @audit_action("ACCOUNT_UNLOCKED", resource_type="account")
 def unlock_user(username):
-    # Lock state belongs to one (username, category) account. `category` is
-    # passed as a query param since this is a plain PUT with no body.
     category = (request.args.get("category") or "").strip()
 
-    if _user_category_column_available():
+    if _USER_CATEGORY_PROBE.available():
         if not category or category not in KNOWN_CATEGORIES:
             return jsonify({"error": "A valid category is required to unlock this credential"}), 400
         user = get_user_by_username_category(username, category)
@@ -1430,7 +1373,6 @@ def unlock_user(username):
             "lock_level":     0,
         }).eq("username", username).eq("category", category))
     else:
-        # Pre-migration fallback: one shared account per username.
         user = get_user_by_username(username)
         if not user:
             return jsonify({"error": "User not found"}), 404
@@ -1471,8 +1413,6 @@ def my_permissions():
     if not rows:
         return jsonify({"role": "None", "permissions": ["dashboard"], "is_admin": False})
 
-    # A username may hold one row per category, so role names and permissions
-    # across all of them are combined.
     role_names = []
     combined = []
     seen = set()
@@ -1490,12 +1430,11 @@ def my_permissions():
     if not combined:
         return jsonify({"role": "None", "permissions": ["dashboard"], "is_admin": False})
 
-    payload = {
+    return jsonify({
         "role":        " + ".join(role_names) if role_names else "None",
         "permissions": combined,
         "is_admin":    "role_management" in combined,
-    }
-    return jsonify(payload)
+    })
 
 
 # --- OFFLINE ACCOUNTS EXPORT -------------------------------------------------
@@ -1505,9 +1444,8 @@ def my_permissions():
 @audit_action("OFFLINE_ACCOUNTS_EXPORTED", resource_type="account")
 def offline_accounts():
     """Encrypted offline records for every ACTIVE credential (one that still has
-    a user_roles row). Accounts that were disabled or whose role was removed are
-    left out, so the device drops them on the next sync."""
-    if not _category_column_available() or not _user_category_column_available():
+    a user_roles row)."""
+    if not _CATEGORY_PROBE.available() or not _USER_CATEGORY_PROBE.available():
         return jsonify({"error": MIGRATION_REQUIRED_ERROR}), 500
 
     assigned = _exec(
@@ -1521,14 +1459,12 @@ def offline_accounts():
 
     accounts = []
     for u in users:
-        key = (u["username"], u.get("category"))
-        if key not in active:
+        if (u["username"], u.get("category")) not in active:
             continue
         accounts.append({
             "username": u["username"],
             "category": u.get("category"),
             "offline_record": u.get("offline_record"),
-            # No record yet: this account must log in online once, or be reset.
             "needs_reset": not u.get("offline_record"),
         })
 
